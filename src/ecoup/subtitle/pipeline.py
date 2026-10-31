@@ -12,7 +12,7 @@ from .burn import burn_subtitles, make_ass_for_video
 from .config import SubtitleConfig
 from .report import SubtitleReport
 from .segments import Segment, TranslatedSegment, normalize_segments
-from .srt import segments_to_cues, translated_to_cues, write_srt
+from .srt import read_srt, segments_to_cues, translated_to_cues, write_srt
 from .translate.base import TranslatorBackend
 
 STEPS = ("audio", "asr", "normalize", "translate", "srt", "burn")
@@ -48,7 +48,77 @@ class SubtitlePipeline:
             self._translator = GeminiTranslator(self.config.translate, should_cancel=lambda: self._cancelled)
         return self._translator
 
-    def run(self, video: str | Path, output: Optional[str | Path] = None, out_dir: Optional[str | Path] = None) -> SubtitleReport:
+    def transcribe_only(
+        self,
+        video: str | Path,
+        out_dir: Optional[str | Path] = None,
+    ) -> tuple[Path, str, SubtitleReport]:
+        """Run only Audio Extraction + Whisper ASR, producing original SRT for preview/editing."""
+        cfg = self.config
+        video = Path(video)
+        out_dir = Path(out_dir) if out_dir else video.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = video.stem
+        work = Path(cfg.work_dir) if cfg.work_dir else out_dir / f".sub_work_{stem}"
+        work.mkdir(parents=True, exist_ok=True)
+
+        rep = SubtitleReport(video=str(video))
+        t_all = time.time()
+
+        # 1. audio
+        self._progress("audio", 0.0)
+        t = time.time()
+        try:
+            wav = extract_audio(video, work / "audio.wav")
+            if cfg.asr.use_demucs:
+                from .audio import extract_vocals
+                wav = extract_vocals(wav, work / "vocals.wav")
+        except NoAudioError as exc:
+            rep.warnings.append(str(exc))
+            raise
+        except Exception as exc:
+            rep.warnings.append(f"Demucs vocal separation warning: {exc}")
+        rep.timings_s["audio"] = round(time.time() - t, 2)
+        if self._cancelled:
+            return Path(""), "", self._cancel(rep)
+
+        # 2. ASR
+        self._progress("asr", 0.0)
+        t = time.time()
+        res = self.asr.transcribe(str(wav), cfg.asr, on_segment=None, should_cancel=lambda: self._cancelled)
+        rep.timings_s["asr"] = round(time.time() - t, 2)
+        rep.detected_language = res.language
+        rep.language_probability = res.language_probability
+        rep.asr_peak_vram_gb = res.peak_vram_gb
+        rep.asr_segments = len(res.segments)
+        if self._cancelled:
+            return Path(""), "", self._cancel(rep)
+        if not res.segments:
+            rep.warnings.append("ASR produced no speech segments.")
+
+        # 3. normalise + write original SRT
+        segs = normalize_segments(res.segments, cfg.segment)
+        for s in segs:
+            if not s.language:
+                s.language = res.language
+        rep.cues = len(segs)
+        orig_srt = write_srt(
+            out_dir / f"{stem}.{res.language or 'src'}.srt",
+            segments_to_cues(segs, cfg.segment.max_chars_per_line, cfg.segment.max_lines),
+        )
+        rep.outputs["srt_original"] = str(orig_srt)
+        rep.timings_s["total"] = round(time.time() - t_all, 2)
+        self._progress("asr", 1.0)
+        srt_content = orig_srt.read_text(encoding="utf-8")
+        return orig_srt, srt_content, rep
+
+    def run(
+        self,
+        video: str | Path,
+        output: Optional[str | Path] = None,
+        out_dir: Optional[str | Path] = None,
+        custom_srt: Optional[str | Path] = None,
+    ) -> SubtitleReport:
         cfg = self.config
         video = Path(video)
         out_dir = Path(out_dir) if out_dir else (Path(output).parent if output else video.parent)
@@ -61,51 +131,80 @@ class SubtitlePipeline:
         rep = SubtitleReport(video=str(video))
         t_all = time.time()
 
-        # 1. audio
-        self._progress("audio", 0.0)
-        t = time.time()
-        try:
-            wav = extract_audio(video, work / "audio.wav")
-        except NoAudioError as exc:
-            rep.warnings.append(str(exc))
-            raise
-        rep.timings_s["audio"] = round(time.time() - t, 2)
-        if self._cancelled:
-            return self._cancel(rep)
+        if custom_srt:
+            # Custom / pre-reviewed SRT provided by user: bypass Audio & ASR
+            custom_srt_path = Path(custom_srt)
+            if not custom_srt_path.is_file():
+                # Provided as raw SRT text content
+                tmp_srt = work / "custom_input.srt"
+                tmp_srt.write_text(str(custom_srt), encoding="utf-8")
+                custom_srt_path = tmp_srt
+            cues_in = read_srt(custom_srt_path)
+            res_lang = cfg.asr.language or "src"
+            rep.detected_language = res_lang
+            raw_segs = [Segment(start=c[0], end=c[1], text=c[2], language=res_lang) for c in cues_in]
+            segs = normalize_segments(raw_segs, cfg.segment)
+            for s in segs:
+                if not s.language:
+                    s.language = res_lang
+            orig_srt = custom_srt_path
+            rep.outputs["srt_original"] = str(orig_srt)
+            rep.cues = len(segs)
+        else:
+            # 1. audio
+            self._progress("audio", 0.0)
+            t = time.time()
+            try:
+                wav = extract_audio(video, work / "audio.wav")
+                if cfg.asr.use_demucs:
+                    from .audio import extract_vocals
+                    wav = extract_vocals(wav, work / "vocals.wav")
+            except NoAudioError as exc:
+                rep.warnings.append(str(exc))
+                raise
+            except Exception as exc:
+                rep.warnings.append(f"Demucs vocal separation warning: {exc}")
+            rep.timings_s["audio"] = round(time.time() - t, 2)
+            if self._cancelled:
+                return self._cancel(rep)
 
-        # 2. ASR
-        self._progress("asr", 0.0)
-        t = time.time()
-        res = self.asr.transcribe(str(wav), cfg.asr, on_segment=None, should_cancel=lambda: self._cancelled)
-        rep.timings_s["asr"] = round(time.time() - t, 2)
-        rep.detected_language = res.language
-        rep.language_probability = res.language_probability
-        rep.asr_peak_vram_gb = res.peak_vram_gb
-        rep.asr_segments = len(res.segments)
-        if self._cancelled:
-            return self._cancel(rep)
-        if not res.segments:
-            rep.warnings.append("ASR produced no speech segments.")
+            # 2. ASR
+            self._progress("asr", 0.0)
+            t = time.time()
+            res = self.asr.transcribe(str(wav), cfg.asr, on_segment=None, should_cancel=lambda: self._cancelled)
+            rep.timings_s["asr"] = round(time.time() - t, 2)
+            rep.detected_language = res.language
+            rep.language_probability = res.language_probability
+            rep.asr_peak_vram_gb = res.peak_vram_gb
+            rep.asr_segments = len(res.segments)
+            if self._cancelled:
+                return self._cancel(rep)
+            if not res.segments:
+                rep.warnings.append("ASR produced no speech segments.")
 
-        # 3. normalise + original SRT
-        segs = normalize_segments(res.segments, cfg.segment)
-        for s in segs:
-            s.language = res.language
-        rep.cues = len(segs)
-        orig_srt = write_srt(out_dir / f"{stem}.{res.language or 'src'}.srt",
-                             segments_to_cues(segs, cfg.segment.max_chars_per_line, cfg.segment.max_lines))
-        rep.outputs["srt_original"] = str(orig_srt)
+            # 3. normalise + original SRT
+            segs = normalize_segments(res.segments, cfg.segment)
+            # FIX H4: Preserve individual segment language instead of overwriting all
+            for s in segs:
+                if not s.language:
+                    s.language = res.language
+            rep.cues = len(segs)
+            orig_srt = write_srt(out_dir / f"{stem}.{res.language or 'src'}.srt",
+                                 segments_to_cues(segs, cfg.segment.max_chars_per_line, cfg.segment.max_lines))
+            rep.outputs["srt_original"] = str(orig_srt)
+            res_lang = res.language
+
         self._progress("normalize", 1.0)
 
         # 4. translate
         target = cfg.translate.target_language
         translated: list[TranslatedSegment]
-        if (res.language or "").lower().split("-")[0] == target.lower().split("-")[0]:
+        if (res_lang or "").lower().split("-")[0] == target.lower().split("-")[0]:
             rep.skipped_translation = True
             translated = [TranslatedSegment(s.start, s.end, s.text, s.text, s.language) for s in segs]
         else:
             t = time.time()
-            translated = self._translate_all(segs, res.language)
+            translated = self._translate_all(segs, res_lang)
             rep.timings_s["translate"] = round(time.time() - t, 2)
             tr = self._translator
             rep.translate_stats = dict(getattr(tr, "stats", {}) or {})

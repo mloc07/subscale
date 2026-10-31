@@ -518,6 +518,60 @@ def run_upscale(
     return str(out_path), f"🎉 Hoàn tất ({tag})! Video đã lưu: {out_path.name}"
 
 
+def run_transcribe_only(
+    input_file_path: Optional[str],
+    source_lang_choice: str,
+    audio_mode_choice: str,
+    whisper_model_choice: str,
+    initial_prompt_input: str,
+    use_demucs_choice: bool,
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Run ASR only and return original SRT text for preview and manual editing."""
+    global active_subtitle_pipeline
+
+    if not input_file_path or not os.path.exists(input_file_path):
+        raise gr.Error("Vui lòng chọn video đầu vào hợp lệ.")
+
+    from ecoup.subtitle.config import SubtitleConfig
+    from ecoup.subtitle.pipeline import SubtitlePipeline
+
+    cfg = SubtitleConfig()
+    if audio_mode_choice:
+        mode_token = audio_mode_choice.split()[0].strip().lower()
+        if mode_token in ("music", "speech", "off"):
+            cfg.asr.audio_mode = mode_token
+    if not source_lang_choice or "auto" in source_lang_choice.lower():
+        cfg.asr.language = None
+    else:
+        cfg.asr.language = source_lang_choice.split()[0].strip()
+    if whisper_model_choice:
+        cfg.asr.model = whisper_model_choice.split()[0].strip()
+    if initial_prompt_input and initial_prompt_input.strip():
+        cfg.asr.initial_prompt = initial_prompt_input.strip()
+    cfg.asr.use_demucs = bool(use_demucs_choice)
+
+    out_dir = Path("outputs") / "subtitles"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    progress(0.1, desc="Khởi động bộ nhận diện giọng nói...")
+
+    pipe = SubtitlePipeline(config=cfg)
+    active_subtitle_pipeline = pipe
+    try:
+        progress(0.4, desc="Đang nhận dạng văn bản bằng Whisper...")
+        srt_path, srt_content, rep = pipe.transcribe_only(input_file_path, out_dir=out_dir)
+    except Exception as e:
+        if pipe._cancelled:
+            return "", "⏹️ Đã hủy tiến trình nhận diện."
+        raise gr.Error(f"Lỗi nhận diện âm thanh: {e}") from e
+    finally:
+        active_subtitle_pipeline = None
+
+    msg = f"✅ Nhận diện hoàn tất! Đã tìm thấy {rep.cues} câu ({rep.detected_language}). Bạn có thể sửa trực tiếp ở ô bên dưới."
+    return srt_content, msg
+
+
 def run_subtitle(
     input_file_path: Optional[str],
     source_lang_choice: str,
@@ -531,6 +585,9 @@ def run_subtitle(
     burn_in_checked: bool,
     show_orig_checked: bool,
     font_name_input: str,
+    initial_prompt_input: str = "",
+    custom_srt_input: str = "",
+    use_demucs_choice: bool = False,
     progress=gr.Progress(track_tqdm=False),
 ):
     """Execute automatic subtitle pipeline (Audio extract -> Whisper ASR -> Gemini Translate -> Burn-in)."""
@@ -586,6 +643,9 @@ def run_subtitle(
         cfg.asr.model = whisper_model_choice.split()[0].strip()
     if gemini_model_choice:
         cfg.translate.model = gemini_model_choice.split()[0].strip()
+    if initial_prompt_input and initial_prompt_input.strip():
+        cfg.asr.initial_prompt = initial_prompt_input.strip()
+    cfg.asr.use_demucs = bool(use_demucs_choice)
 
     # Context note & Glossary
     cfg.translate.context_note = context_note_input.strip() if context_note_input else ""
@@ -637,7 +697,8 @@ def run_subtitle(
         progress(0.02, desc="Khởi động pipeline phụ đề...")
         in_p = Path(input_file_path)
         out_video_path = out_dir / f"{in_p.stem}_sub.mp4"
-        rep = pipe.run(input_file_path, output=out_video_path, out_dir=out_dir)
+        custom_srt_val = custom_srt_input.strip() if custom_srt_input and custom_srt_input.strip() else None
+        rep = pipe.run(input_file_path, output=out_video_path, out_dir=out_dir, custom_srt=custom_srt_val)
     except Exception as e:
         if pipe._cancelled:
             return None, None, None, None, None, "⏹️ Tiến trình phụ đề đã được hủy thành công."
@@ -972,13 +1033,23 @@ def create_ui():
 
                             sub_audio_mode_dd = gr.Dropdown(
                                 choices=[
-                                    "music (Âm nhạc / MV / Beat dày - Bắt trọn lời bài hát)",
                                     "speech (Hội thoại / Vlog / Phim - Lọc tiếng ồn chuẩn)",
+                                    "music (Âm nhạc / MV / Beat dày - Bắt trọn lời bài hát)",
                                     "off (Tắt hoàn toàn bộ lọc VAD)",
                                 ],
-                                value="music (Âm nhạc / MV / Beat dày - Bắt trọn lời bài hát)",
+                                value="speech (Hội thoại / Vlog / Phim - Lọc tiếng ồn chuẩn)",
                                 label="Chế độ âm thanh (VAD Audio Mode)",
-                                info="Chọn 'music' cho bài hát/MV để không bị nuốt lời do beat nhạc; chọn 'speech' cho vlog/hội thoại lọc ồn.",
+                                info="Mặc định 'speech' cho vlog/hội thoại lọc ồn; chọn 'music' hoặc 'off' cho bài hát/MV để không bị nuốt lời.",
+                            )
+                            with gr.Row():
+                                sub_use_demucs_cb = gr.Checkbox(
+                                    value=False,
+                                    label="Tách giọng hát bằng AI (Demucs Vocal Separation - Tối ưu cho bài hát/MV có beat lớn)",
+                                )
+                            sub_initial_prompt_tb = gr.Textbox(
+                                label="Từ vựng gợi ý / Lời bài hát tham khảo (Initial Prompt)",
+                                placeholder="Nhập tên riêng, thuật ngữ hoặc lời bài hát để Whisper bắt từ chuẩn xác (ví dụ: Tequila, formula, medulla...)...",
+                                lines=2,
                             )
 
                         with gr.Group():
@@ -1054,6 +1125,20 @@ def create_ui():
                                 label="Phông chữ hiển thị (Hỗ trợ tiếng Việt có dấu, ví dụ: Noto Sans, Arial)",
                             )
 
+                        with gr.Accordion("✍️ 5. Xem trước & Tùy chỉnh phụ đề gốc (Giải pháp can thiệp 2 bước)", open=True):
+                            gr.Markdown(
+                                "*Bạn có thể trích xuất bản nháp phụ đề để kiểm tra hoặc tự tay chỉnh sửa lỗi trước khi gửi sang Gemini dịch và ghép vào video.*"
+                            )
+                            with gr.Row():
+                                btn_transcribe_preview = gr.Button("🔍 1. Chỉ nhận diện âm thanh (Tạo bản nháp SRT)", variant="secondary")
+                            sub_preview_srt_tb = gr.Textbox(
+                                label="Bản nháp phụ đề gốc (Có thể sửa trực tiếp hoặc dán phụ đề SRT có sẵn vào đây)",
+                                placeholder="Bản nháp SRT sẽ xuất hiện ở đây sau khi bấm 'Chỉ nhận diện âm thanh'. Bạn có thể sửa câu từ, thời gian hoặc dán file SRT ngoài vào...",
+                                lines=8,
+                            )
+                            with gr.Row():
+                                btn_sub_from_preview = gr.Button("⚡ 2. Dịch & Ghép phụ đề từ bản nháp trên", variant="primary")
+
                     # ================= RIGHT COLUMN: CONTROLS & SUBTITLE OUTPUT =================
                     with gr.Column(scale=6):
                         with gr.Group():
@@ -1102,6 +1187,9 @@ def create_ui():
                     sub_burn_cb,
                     sub_show_orig_cb,
                     sub_font_name_tb,
+                    sub_initial_prompt_tb,
+                    sub_preview_srt_tb,
+                    sub_use_demucs_cb,
                 ]
 
                 sub_outputs = [
@@ -1119,10 +1207,29 @@ def create_ui():
                     outputs=sub_outputs,
                 )
 
+                sub_preview_event = btn_transcribe_preview.click(
+                    fn=run_transcribe_only,
+                    inputs=[
+                        sub_in_file,
+                        sub_source_lang_dd,
+                        sub_audio_mode_dd,
+                        sub_whisper_dd,
+                        sub_initial_prompt_tb,
+                        sub_use_demucs_cb,
+                    ],
+                    outputs=[sub_preview_srt_tb, sub_status_tb],
+                )
+
+                sub_from_preview_event = btn_sub_from_preview.click(
+                    fn=run_subtitle,
+                    inputs=sub_inputs,
+                    outputs=sub_outputs,
+                )
+
                 btn_sub_cancel.click(
                     fn=cancel_subtitle,
                     outputs=[sub_status_tb],
-                    cancels=[sub_run_event],
+                    cancels=[sub_run_event, sub_preview_event, sub_from_preview_event],
                 )
 
     return demo

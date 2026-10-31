@@ -43,6 +43,10 @@ models/*.bin
 *.mkv
 *.avi
 *.mov
+*.wav
+*.mp3
+*.flac
+*.m4a
 *.srt
 *.ass
 scratch/

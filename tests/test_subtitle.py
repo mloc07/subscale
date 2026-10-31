@@ -333,3 +333,73 @@ def test_pipeline_empty_asr_and_cancel(tiny_video, tmp_path):
 
     pipe = SubtitlePipeline(cfg, asr=CancellingAsr([Segment(0, 1, "x y z", "en")]), translator=FakeTranslator())
     assert pipe.run(tiny_video, out_dir=tmp_path / "c").cancelled
+
+
+def test_pipeline_with_custom_srt_bypasses_asr(tiny_video, tmp_path):
+    # Tests preview/custom SRT execution (bypasses ASR and audio extraction)
+    srt_file = tmp_path / "manual.srt"
+    write_srt(srt_file, [(0.5, 2.5, "Custom manual line 1"), (3.0, 5.0, "Custom manual line 2")])
+    cfg = SubtitleConfig()
+    cfg.burn_in = False
+    pipe = SubtitlePipeline(cfg, asr=None, translator=FakeTranslator())
+    rep = pipe.run(tiny_video, out_dir=tmp_path / "custom_out", custom_srt=srt_file)
+    assert rep.cues == 2
+    assert "audio" not in rep.timings_s and "asr" not in rep.timings_s
+    assert "srt_translated" in rep.outputs
+    tr_srt = read_srt(rep.outputs["srt_translated"])
+    assert tr_srt[0][2].startswith("VI: Custom manual line 1")
+
+
+def test_pipeline_transcribe_only(tiny_video, tmp_path):
+    # Tests transcribe_only for human review
+    asr = FakeAsr([Segment(0.5, 2.0, "First spoken words", "en")], lang="en")
+    cfg = SubtitleConfig()
+    pipe = SubtitlePipeline(cfg, asr=asr, translator=FakeTranslator())
+    srt_path, srt_text, rep = pipe.transcribe_only(tiny_video, out_dir=tmp_path / "review")
+    assert srt_path.exists()
+    assert "First spoken words" in srt_text
+    assert rep.cues == 1
+
+
+def test_lyric_snapping():
+    from ecoup.subtitle.snapping import parse_raw_lyrics, snap_lyrics_to_segments
+    raw_lyric = """[Verse 1]
+Baby, come near me now
+You see this your love, don't tie me down
+Call me your prisoner"""
+    lines = parse_raw_lyrics(raw_lyric)
+    assert len(lines) == 3
+    assert lines[0] == "Baby, come near me now"
+
+    # Whisper slightly misheard
+    whisper_segs = [
+        Segment(0.0, 2.0, "Baby come near me now"),
+        Segment(2.2, 4.5, "You see this love dont tie me down"),
+        Segment(4.8, 6.0, "Call me your prisoner"),
+    ]
+    snapped = snap_lyrics_to_segments(whisper_segs, raw_lyric)
+    assert snapped[1].text == "You see this your love, don't tie me down"
+
+
+def test_pipeline_with_demucs_mock(tiny_video, tmp_path, monkeypatch):
+    called = []
+    def fake_extract_vocals(media_path, out_wav_path, sample_rate=16000):
+        called.append(media_path)
+        p = Path(out_wav_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"RIFFdummywavdata")
+        return p
+
+    import ecoup.subtitle.audio
+    monkeypatch.setattr(ecoup.subtitle.audio, "extract_vocals", fake_extract_vocals)
+
+    cfg = SubtitleConfig()
+    cfg.asr.use_demucs = True
+    cfg.burn_in = False
+    asr = FakeAsr([Segment(0.5, 2.0, "Vocal line", "en")], lang="en")
+    pipe = SubtitlePipeline(cfg, asr=asr, translator=FakeTranslator())
+    rep = pipe.run(tiny_video, out_dir=tmp_path / "demucs_test")
+    assert len(called) == 1
+    assert rep.cues == 1
+
+

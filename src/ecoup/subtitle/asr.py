@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
@@ -62,6 +63,26 @@ def _gpu_used_gb() -> Optional[float]:
         return float(out[0]) / 1024.0 if out else None
     except Exception:
         return None
+
+
+_HALLUCINATION_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"^thanks for watching!?\.?$",
+        r"^thank you for watching!?\.?$",
+        r"^thanks for watching this video!?\.?$",
+        r"hãy subscribe cho kênh",
+        r"subscribe for more",
+        r"đăng ký kênh để không bỏ lỡ",
+        r"^like and subscribe!?\.?$",
+        r"^please subscribe!?\.?$",
+        r"kênh la la school",
+    ]
+]
+
+
+def _is_hallucination(text: str) -> bool:
+    clean = re.sub(r"\s+", " ", text.strip()).lower()
+    return any(p.search(clean) for p in _HALLUCINATION_PATTERNS)
 
 
 def _load_wav_float32(path):
@@ -137,6 +158,8 @@ class FasterWhisperBackend:
             condition_on_previous_text=cfg.condition_on_previous_text,
             no_speech_threshold=cfg.no_speech_threshold,
         )
+        if cfg.initial_prompt:
+            kwargs["initial_prompt"] = cfg.initial_prompt
         if vad_filter and vad_params:
             kwargs["vad_parameters"] = vad_params
 
@@ -146,54 +169,94 @@ class FasterWhisperBackend:
         segs: list[Segment] = []
 
         try:
-            # Dynamic multilingual chunking when language is auto and audio is long (>25s)
-            if cfg.language is None and cfg.multilingual_chunking and total_sec > 25.0:
-                chunk_len = 25.0
-                cur = 0.0
-                detected_langs: list[tuple[str, float]] = []
-                while cur < total_sec:
-                    if should_cancel and should_cancel():
-                        break
-                    end = min(total_sec, cur + chunk_len)
-                    chunk_slice = audio_arr[int(cur * sr) : int(end * sr)]
-                    chunk_iter, chunk_info = model.transcribe(chunk_slice, **kwargs)
-                    if chunk_info and chunk_info.language:
-                        detected_langs.append((chunk_info.language, float(getattr(chunk_info, "language_probability", 0.0))))
-                    for s in chunk_iter:
-                        if should_cancel and should_cancel():
-                            break
-                        s_text = s.text.strip()
-                        if s_text:
-                            segs.append(Segment(
-                                start=round(cur + float(s.start), 3),
-                                end=round(cur + float(s.end), 3),
-                                text=s_text,
-                                language=chunk_info.language,
-                            ))
-                    if on_segment:
-                        on_segment(end)
-                    cur += chunk_len
-
-                if detected_langs:
-                    from collections import Counter
-                    counts = Counter([l[0] for l in detected_langs])
-                    detected_lang = counts.most_common(1)[0][0]
-                    lang_prob = max((p for l, p in detected_langs if l == detected_lang), default=0.5)
-                else:
-                    detected_lang, lang_prob = "auto", 0.0
-            else:
-                # Monolithic transcribe
+            # Monolithic transcribe is default and most reliable (no artificial cuts at multiples of 25s)
+            if not cfg.multilingual_chunking or cfg.language is not None or total_sec <= 30.0:
                 seg_iter, info = model.transcribe(audio_arr, **kwargs)
+                det_lang = info.language
+                if cfg.language_whitelist and det_lang not in cfg.language_whitelist:
+                    det_lang = cfg.language_whitelist[0]
                 for s in seg_iter:
                     if should_cancel and should_cancel():
                         break
                     s_text = s.text.strip()
-                    if s_text:
-                        segs.append(Segment(start=float(s.start), end=float(s.end), text=s_text, language=info.language))
+                    if s_text and not _is_hallucination(s_text):
+                        segs.append(Segment(start=float(s.start), end=float(s.end), text=s_text, language=det_lang))
                     if on_segment:
                         on_segment(float(s.end))
-                detected_lang = info.language
+                detected_lang = det_lang
                 lang_prob = float(getattr(info, "language_probability", 0.0))
+            else:
+                # Dynamic multilingual chunking guided by VAD silence pauses (NOT rigid 25s intervals)
+                try:
+                    from faster_whisper.vad import get_speech_timestamps, VadOptions
+                    v_opts = VadOptions(
+                        threshold=vad_params.get("threshold", 0.35) if vad_params else 0.35,
+                        min_silence_duration_ms=600,
+                        speech_pad_ms=400,
+                    )
+                    speech_blocks = get_speech_timestamps(audio_arr, vad_options=v_opts, sampling_rate=sr)
+                except Exception:
+                    speech_blocks = []
+
+                if not speech_blocks:
+                    # Fallback to monolithic if VAD finds no distinct blocks
+                    seg_iter, info = model.transcribe(audio_arr, **kwargs)
+                    det_lang = info.language
+                    if cfg.language_whitelist and det_lang not in cfg.language_whitelist:
+                        det_lang = cfg.language_whitelist[0]
+                    for s in seg_iter:
+                        if should_cancel and should_cancel():
+                            break
+                        s_text = s.text.strip()
+                        if s_text and not _is_hallucination(s_text):
+                            segs.append(Segment(start=float(s.start), end=float(s.end), text=s_text, language=det_lang))
+                    detected_lang, lang_prob = det_lang, float(getattr(info, "language_probability", 0.0))
+                else:
+                    # Group speech blocks into natural chunks (15s to 35s) at natural speech pauses
+                    chunks: list[tuple[float, float]] = []
+                    c_start = max(0.0, float(speech_blocks[0]["start"]) / sr - 0.5)
+                    c_end = float(speech_blocks[0]["end"]) / sr + 0.5
+                    for blk in speech_blocks[1:]:
+                        b_s = float(blk["start"]) / sr
+                        b_e = float(blk["end"]) / sr
+                        if (b_e - c_start) > 30.0 or (b_s - c_end) > 1.2:
+                            chunks.append((c_start, min(total_sec, c_end + 0.5)))
+                            c_start = max(0.0, b_s - 0.5)
+                        c_end = b_e
+                    chunks.append((c_start, min(total_sec, c_end + 0.5)))
+
+                    detected_langs: list[tuple[str, float]] = []
+                    for c_start, c_end in chunks:
+                        if should_cancel and should_cancel():
+                            break
+                        c_slice = audio_arr[int(c_start * sr) : int(c_end * sr)]
+                        c_iter, c_info = model.transcribe(c_slice, **kwargs)
+                        chunk_lang = c_info.language if c_info else None
+                        if cfg.language_whitelist and chunk_lang and chunk_lang not in cfg.language_whitelist:
+                            chunk_lang = cfg.language_whitelist[0]
+                        if chunk_lang:
+                            detected_langs.append((chunk_lang, float(getattr(c_info, "language_probability", 0.0))))
+                        for s in c_iter:
+                            if should_cancel and should_cancel():
+                                break
+                            s_text = s.text.strip()
+                            if s_text and not _is_hallucination(s_text):
+                                segs.append(Segment(
+                                    start=round(c_start + float(s.start), 3),
+                                    end=round(c_start + float(s.end), 3),
+                                    text=s_text,
+                                    language=chunk_lang,
+                                ))
+                        if on_segment:
+                            on_segment(c_end)
+
+                    if detected_langs:
+                        from collections import Counter
+                        counts = Counter([l[0] for l in detected_langs])
+                        detected_lang = counts.most_common(1)[0][0]
+                        lang_prob = max((p for l, p in detected_langs if l == detected_lang), default=0.5)
+                    else:
+                        detected_lang, lang_prob = "auto", 0.0
 
             if device == "cuda":
                 # ctranslate2 allocates outside PyTorch, so torch.cuda counters read 0: ask the driver.

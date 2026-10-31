@@ -16,8 +16,8 @@ class AsrConfig:
     device: str = "auto"              # "auto" | "cuda" | "cpu"
     compute_type: str = "auto"        # "auto" | "float16" | "int8_float16" | "int8" | "float32"
     language: Optional[str] = None    # None = auto-detect; otherwise ISO code, e.g. "en", "zh", "ja", "ko"
-    audio_mode: str = "music"         # "music" (optimized for songs/beats) | "speech" (standard VAD for vlogs) | "off" (no VAD)
-    multilingual_chunking: bool = True # Dynamic chunk-level language detection when language=None
+    audio_mode: str = "speech"        # "speech" (standard VAD for vlogs) | "music" (optimized for songs/beats) | "off" (no VAD)
+    multilingual_chunking: bool = False # Off by default; when on, uses silence-based chunking
     vad_filter: bool = True           # Silero VAD: reduces hallucinated text in silence/music
     vad_min_silence_ms: int = 800
     vad_threshold: float = 0.25
@@ -25,6 +25,9 @@ class AsrConfig:
     no_speech_threshold: float = 0.6
     beam_size: int = 5
     condition_on_previous_text: bool = False  # False reduces repetition loops
+    initial_prompt: Optional[str] = None      # Vocabulary / lyrics / proper nouns hint
+    language_whitelist: Optional[list[str]] = None # Restrict allowed languages when auto-detecting
+    use_demucs: bool = False                  # Isolate vocals using Demucs before Whisper ASR
 
     def validate(self) -> None:
         if not self.model:
