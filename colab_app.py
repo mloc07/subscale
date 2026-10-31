@@ -1079,21 +1079,21 @@ def create_ui():
                                 )
 
                             _pre_key = os.environ.get("GEMINI_API_KEY", "").strip()
+                            if not _pre_key and Path("/content/.gemini_key").exists():
+                                try:
+                                    _pre_key = Path("/content/.gemini_key").read_text(encoding="utf-8").strip()
+                                except Exception:
+                                    pass
                             if not _pre_key:
                                 try:
                                     from google.colab import userdata
                                     _pre_key = (userdata.get("GEMINI_API_KEY") or "").strip()
                                 except Exception:
                                     pass
-                            if not _pre_key and Path("/content/.gemini_key").exists():
-                                try:
-                                    _pre_key = Path("/content/.gemini_key").read_text(encoding="utf-8").strip()
-                                except Exception:
-                                    pass
 
                             sub_api_key_tb = gr.Textbox(
-                                label="Khóa Gemini API (Dán vào đây hoặc thiết lập trong Colab Secrets)",
-                                placeholder="Đã tìm thấy API Key từ hệ thống (có thể để trống)" if _pre_key else "Dán API Key vào đây (ví dụ: AQ.Ab8... hoặc AIzaSy...)",
+                                label="Khóa Gemini API (✅ Đã tự động nạp từ Colab)" if _pre_key else "Khóa Gemini API (Dán vào đây hoặc thiết lập trong Colab Secrets)",
+                                placeholder="Đã nạp sẵn API Key từ hệ thống (có thể để trống)" if _pre_key else "Dán API Key vào đây (ví dụ: AQ.Ab8... hoặc AIzaSy...)",
                                 value=_pre_key if _pre_key else "",
                                 type="password",
                             )
@@ -1240,7 +1240,16 @@ def main():
     parser.add_argument("--share", action="store_true", help="Generate public gradio.live link")
     parser.add_argument("--port", type=int, default=7860, help="Local server port")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Binding host")
+    parser.add_argument("--gemini-key", type=str, default="", help="Gemini API Key")
     args = parser.parse_args()
+
+    if args.gemini_key and args.gemini_key.strip():
+        k = args.gemini_key.strip()
+        os.environ["GEMINI_API_KEY"] = k
+        try:
+            Path("/content/.gemini_key").write_text(k, encoding="utf-8")
+        except Exception:
+            pass
 
     demo = create_ui()
     demo.queue()
