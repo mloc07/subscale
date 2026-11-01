@@ -70,6 +70,9 @@ _HALLUCINATION_PATTERNS = [
         r"^thanks for watching!?\.?$",
         r"^thank you for watching!?\.?$",
         r"^thanks for watching this video!?\.?$",
+        r"^thank you!?\.?$",
+        r"^thanks!?\.?$",
+        r"^thank you very much!?\.?$",
         r"hãy subscribe cho kênh",
         r"subscribe for more",
         r"đăng ký kênh để không bỏ lỡ",
@@ -134,7 +137,8 @@ class FasterWhisperBackend:
         # Configure VAD presets based on audio_mode
         vad_filter = cfg.vad_filter
         vad_params = {}
-        if cfg.audio_mode == "off":
+        if cfg.audio_mode == "off" or cfg.use_demucs:
+            # Demucs isolates clean vocals; disabling Silero VAD avoids clipping singing vibrato
             vad_filter = False
         elif cfg.audio_mode == "music":
             vad_filter = True
