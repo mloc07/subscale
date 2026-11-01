@@ -69,15 +69,24 @@ class SubtitlePipeline:
         self._progress("audio", 0.0)
         t = time.time()
         try:
-            wav = extract_audio(video, work / "audio.wav")
             if cfg.asr.use_demucs:
-                from .audio import extract_vocals
-                wav = extract_vocals(wav, work / "vocals.wav")
+                try:
+                    from .audio import extract_vocals
+                    # Extract 44.1 kHz stereo audio for optimal Demucs separation quality
+                    audio_hq = extract_audio(video, work / "audio_hq.wav", sample_rate=44100, channels=2)
+                    wav = extract_vocals(audio_hq, work / "vocals.wav", sample_rate=16000)
+                    rep.demucs_applied = True
+                except NoAudioError:
+                    raise
+                except Exception as exc:
+                    rep.demucs_applied = False
+                    rep.warnings.append(f"Demucs vocal separation warning: {exc}. Fallback to original audio.")
+                    wav = extract_audio(video, work / "audio.wav", sample_rate=16000, channels=1)
+            else:
+                wav = extract_audio(video, work / "audio.wav", sample_rate=16000, channels=1)
         except NoAudioError as exc:
             rep.warnings.append(str(exc))
             raise
-        except Exception as exc:
-            rep.warnings.append(f"Demucs vocal separation warning: {exc}")
         rep.timings_s["audio"] = round(time.time() - t, 2)
         if self._cancelled:
             return Path(""), "", self._cancel(rep)
@@ -155,15 +164,24 @@ class SubtitlePipeline:
             self._progress("audio", 0.0)
             t = time.time()
             try:
-                wav = extract_audio(video, work / "audio.wav")
                 if cfg.asr.use_demucs:
-                    from .audio import extract_vocals
-                    wav = extract_vocals(wav, work / "vocals.wav")
+                    try:
+                        from .audio import extract_vocals
+                        # Extract 44.1 kHz stereo audio for optimal Demucs separation quality
+                        audio_hq = extract_audio(video, work / "audio_hq.wav", sample_rate=44100, channels=2)
+                        wav = extract_vocals(audio_hq, work / "vocals.wav", sample_rate=16000)
+                        rep.demucs_applied = True
+                    except NoAudioError:
+                        raise
+                    except Exception as exc:
+                        rep.demucs_applied = False
+                        rep.warnings.append(f"Demucs vocal separation warning: {exc}. Fallback to original audio.")
+                        wav = extract_audio(video, work / "audio.wav", sample_rate=16000, channels=1)
+                else:
+                    wav = extract_audio(video, work / "audio.wav", sample_rate=16000, channels=1)
             except NoAudioError as exc:
                 rep.warnings.append(str(exc))
                 raise
-            except Exception as exc:
-                rep.warnings.append(f"Demucs vocal separation warning: {exc}")
             rep.timings_s["audio"] = round(time.time() - t, 2)
             if self._cancelled:
                 return self._cancel(rep)

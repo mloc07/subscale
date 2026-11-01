@@ -44,8 +44,8 @@ def video_info(video: str | Path) -> dict:
     }
 
 
-def extract_audio(video: str | Path, wav_path: str | Path, sample_rate: int = 16000) -> Path:
-    """Extract mono 16 kHz PCM WAV. Raises ``NoAudioError`` for silent videos (never hangs)."""
+def extract_audio(video: str | Path, wav_path: str | Path, sample_rate: int = 16000, channels: int = 1) -> Path:
+    """Extract PCM WAV with specified sample rate and channels. Raises ``NoAudioError`` for silent videos."""
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg not found in PATH.")
@@ -56,7 +56,7 @@ def extract_audio(video: str | Path, wav_path: str | Path, sample_rate: int = 16
     wav_path = Path(wav_path)
     wav_path.parent.mkdir(parents=True, exist_ok=True)
     res = subprocess.run(
-        [ffmpeg, "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", str(sample_rate),
+        [ffmpeg, "-y", "-v", "error", "-i", str(video), "-vn", "-ac", str(channels), "-ar", str(sample_rate),
          "-c:a", "pcm_s16le", str(wav_path)],
         capture_output=True, text=True, check=False, timeout=3600,
     )

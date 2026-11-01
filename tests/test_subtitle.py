@@ -400,6 +400,27 @@ def test_pipeline_with_demucs_mock(tiny_video, tmp_path, monkeypatch):
     pipe = SubtitlePipeline(cfg, asr=asr, translator=FakeTranslator())
     rep = pipe.run(tiny_video, out_dir=tmp_path / "demucs_test")
     assert len(called) == 1
+    assert "audio_hq.wav" in str(called[0])
+    assert rep.demucs_applied is True
     assert rep.cues == 1
+
+
+def test_pipeline_demucs_fallback_on_failure(tiny_video, tmp_path, monkeypatch):
+    def failing_extract_vocals(media_path, out_wav_path, sample_rate=16000):
+        raise RuntimeError("CUDA Out of Memory in Demucs")
+
+    import ecoup.subtitle.audio
+    monkeypatch.setattr(ecoup.subtitle.audio, "extract_vocals", failing_extract_vocals)
+
+    cfg = SubtitleConfig()
+    cfg.asr.use_demucs = True
+    cfg.burn_in = False
+    asr = FakeAsr([Segment(0.5, 2.0, "Fallback line", "en")], lang="en")
+    pipe = SubtitlePipeline(cfg, asr=asr, translator=FakeTranslator())
+    rep = pipe.run(tiny_video, out_dir=tmp_path / "demucs_fail_test")
+    assert rep.demucs_applied is False
+    assert any("Demucs vocal separation warning" in w for w in rep.warnings)
+    assert rep.cues == 1
+
 
 

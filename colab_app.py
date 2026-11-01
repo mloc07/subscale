@@ -568,7 +568,12 @@ def run_transcribe_only(
     finally:
         active_subtitle_pipeline = None
 
-    msg = f"✅ Nhận diện hoàn tất! Đã tìm thấy {rep.cues} câu ({rep.detected_language}). Bạn có thể sửa trực tiếp ở ô bên dưới."
+    msg = f"✅ Nhận diện hoàn tất! Đã tìm thấy {rep.cues} câu ({rep.detected_language})."
+    if rep.demucs_applied:
+        msg += " [Đã tách giọng hát Demucs 44.1kHz]"
+    elif use_demucs_choice and any("Demucs" in w for w in rep.warnings):
+        msg += " [⚠️ Cảnh báo: Demucs thất bại, đã dùng âm thanh gốc]"
+    msg += " Bạn có thể sửa trực tiếp ở ô bên dưới."
     return srt_content, msg
 
 
@@ -715,6 +720,10 @@ def run_subtitle(
         f"(Độ tin cậy: {rep.language_probability * 100:.0f}%). "
         f"Tổng {rep.cues} câu thoại. Thời gian xử lý: {rep.timings_s.get('total', 0)}s."
     )
+    if rep.demucs_applied:
+        status_msg += " (Đã tách giọng hát Demucs 44.1kHz)"
+    elif use_demucs_choice and any("Demucs" in w for w in rep.warnings):
+        status_msg += " (⚠️ Cảnh báo: Demucs thất bại, đã dùng âm thanh gốc)"
     if rep.skipped_translation:
         status_msg += " (Bỏ qua dịch do video nguồn đã là tiếng Việt)"
     elif rep.translated_failed:

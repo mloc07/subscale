@@ -21,6 +21,7 @@ class SubtitleReport:
     timings_s: dict = field(default_factory=dict)
     asr_peak_vram_gb: Optional[float] = None
     outputs: dict = field(default_factory=dict)
+    demucs_applied: bool = False
     warnings: list = field(default_factory=list)
     cancelled: bool = False
 
