@@ -16,9 +16,9 @@ class AudioExtractConfig:
 
     def validate(self) -> None:
         if self.sample_rate not in (16000, 22050, 24000, 44100, 48000):
-            raise ValueError(f"Invalid sample_rate: {self.sample_rate}. Expected one of 16000, 22050, 24000, 44100, 48000.")
+            raise ValueError(f"Invalid sample_rate: {self.sample_rate}.")
         if self.channels not in (1, 2):
-            raise ValueError(f"Invalid channels: {self.channels}. Expected 1 (mono) or 2 (stereo).")
+            raise ValueError(f"Invalid channels: {self.channels}.")
 
 
 @dataclass
@@ -46,7 +46,7 @@ class AsrDubbingConfig:
     def validate(self) -> None:
         valid_sizes = ("tiny", "base", "small", "medium", "large-v3")
         if self.model_size not in valid_sizes:
-            raise ValueError(f"Invalid model_size: {self.model_size}. Expected one of {valid_sizes}")
+            raise ValueError(f"Invalid model_size: {self.model_size}.")
 
 
 @dataclass
@@ -80,6 +80,28 @@ class TranslationDubbingConfig:
 
 
 @dataclass
+class TtsDubbingConfig:
+    backend: str = "f5"  # "f5", "gtts", "mock"
+    default_speed: float = 1.0
+    max_speedup: float = 1.25
+    mock: bool = False
+
+    def validate(self) -> None:
+        if self.backend not in ("f5", "gtts", "mock"):
+            raise ValueError(f"Unsupported TTS backend: {self.backend}")
+
+
+@dataclass
+class MixingDubbingConfig:
+    ducking_db: float = -8.0
+    target_sr: int = 44100
+
+    def validate(self) -> None:
+        if self.ducking_db > 0:
+            raise ValueError("ducking_db must be negative (e.g. -8.0 dB).")
+
+
+@dataclass
 class DubbingConfig:
     project_dir: Optional[str] = None
     audio: AudioExtractConfig = field(default_factory=AudioExtractConfig)
@@ -87,6 +109,8 @@ class DubbingConfig:
     asr: AsrDubbingConfig = field(default_factory=AsrDubbingConfig)
     diarization: DiarizationDubbingConfig = field(default_factory=DiarizationDubbingConfig)
     translation: TranslationDubbingConfig = field(default_factory=TranslationDubbingConfig)
+    tts: TtsDubbingConfig = field(default_factory=TtsDubbingConfig)
+    mixing: MixingDubbingConfig = field(default_factory=MixingDubbingConfig)
 
     def validate(self) -> None:
         self.audio.validate()
@@ -94,9 +118,10 @@ class DubbingConfig:
         self.asr.validate()
         self.diarization.validate()
         self.translation.validate()
+        self.tts.validate()
+        self.mixing.validate()
 
     def get_step_hash(self, step_name: str) -> str:
-        """Compute MD5 hash for configuration of a specific pipeline step."""
         data: dict[str, Any] = {}
         if step_name == "S0":
             data = asdict(self.audio)
@@ -110,6 +135,14 @@ class DubbingConfig:
             data = {"diarization": asdict(self.diarization)}
         elif step_name == "S5":
             data = asdict(self.translation)
+        elif step_name == "S6":
+            data = asdict(self.tts)
+        elif step_name == "S7":
+            data = {"speedup": self.tts.max_speedup}
+        elif step_name == "S8":
+            data = asdict(self.mixing)
+        elif step_name == "S9":
+            data = {"mux": "stream_copy"}
         else:
             data = asdict(self)
         raw = json.dumps(data, sort_keys=True)
