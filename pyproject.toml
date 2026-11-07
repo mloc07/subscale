@@ -25,6 +25,13 @@ subtitle = [
     "faster-whisper>=1.0.0",
     "google-genai>=1.0.0",
 ]
+dubbing = [
+    "faster-whisper>=1.0.0",
+    "google-genai>=1.0.0",
+    "demucs>=4.0.0",
+    "speechbrain>=1.0.0",
+    "gtts>=2.5.0",
+]
 
 [project.scripts]
 ecoup = "ecoup.cli:main"

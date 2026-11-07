@@ -272,6 +272,17 @@ def main(args: Optional[list[str]] = None) -> int:
     sub_parser.add_argument("--font", default=None, help="Font family for burn-in (must support Vietnamese)")
     sub_parser.add_argument("--cache-dir", default=None, help="Translation cache directory (enables resume)")
 
+    # dubbing command
+    dub_parser = subparsers.add_parser("dub", help="AI Multi-speaker Dubbing into Vietnamese")
+    dub_parser.add_argument("-i", "--input", required=True, help="Path to input video")
+    dub_parser.add_argument("-o", "--project-dir", help="Project directory (default: <input_dir>/dub_project_<stem>)")
+    dub_parser.add_argument("--backend", default="gtts", choices=["gtts", "f5", "mock"], help="TTS Voice backend")
+    dub_parser.add_argument("--whisper-model", default="base", help="Whisper model size")
+    dub_parser.add_argument("--translate-model", default="gemini-2.5-flash", help="Gemini translation model")
+    dub_parser.add_argument("--num-speakers", type=int, default=None, help="Number of speakers (optional)")
+    dub_parser.add_argument("--context", default="", help="Context notes for translator/dubbing style")
+    dub_parser.add_argument("--step", default=None, choices=["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"], help="Run up to specific step only")
+
     parsed = parser.parse_args(args)
 
     if parsed.command == "doctor":
@@ -308,6 +319,48 @@ def main(args: Optional[list[str]] = None) -> int:
             print("[subtitle] cancelled")
             return 130
         print(json.dumps(rep.to_dict(), ensure_ascii=False, indent=2))
+        return 0
+    elif parsed.command == "dub":
+        import json
+        from pathlib import Path
+        from ecoup.dubbing.config import DubbingConfig
+        from ecoup.dubbing.pipeline import DubbingPipeline
+
+        cfg = DubbingConfig()
+        if parsed.project_dir:
+            cfg.project_dir = parsed.project_dir
+        cfg.tts.backend = parsed.backend
+        cfg.asr.model_size = parsed.whisper_model
+        cfg.translation.model = parsed.translate_model
+        if parsed.num_speakers:
+            cfg.diarization.num_speakers = parsed.num_speakers
+
+        def _on_dub_progress(step: str, frac: float) -> None:
+            print(f"[dubbing] {step}: {int(frac * 100)}%", flush=True)
+
+        pipeline = DubbingPipeline(parsed.input, config=cfg, on_progress=_on_dub_progress)
+
+        if parsed.step == "s0":
+            res = pipeline.run_s0_intake()
+            print(f"[dubbing] S0 complete: {res}")
+        elif parsed.step == "s1":
+            d, b = pipeline.run_s1_separation()
+            print(f"[dubbing] S1 complete: dialogue={d}, bgm={b}")
+        elif parsed.step == "s2":
+            segs = pipeline.run_s2_asr()
+            print(f"[dubbing] S2 complete: {len(segs)} segments transcribed.")
+        elif parsed.step == "s3":
+            segs = pipeline.run_s3_diarization()
+            print(f"[dubbing] S3 complete: {len(segs)} segments diarized.")
+        elif parsed.step == "s4":
+            profs = pipeline.run_s4_voice_profiles()
+            print(f"[dubbing] S4 complete: {len(profs)} voice profiles.")
+        elif parsed.step == "s5":
+            trans = pipeline.run_s5_translation(context_notes=parsed.context)
+            print(f"[dubbing] S5 complete: {len(trans)} segments translated.")
+        else:
+            res = pipeline.run_full_pipeline(context_notes=parsed.context)
+            print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     elif parsed.command == "run":
         from pathlib import Path

@@ -358,6 +358,7 @@ class DubbingPipeline:
                 ref_audio_path=ref_path,
                 speed=self.config.tts.default_speed,
                 target_duration=s.duration,
+                speaker_id=s.speaker_id,
             )
             _write_wav_pcm16(wav_file, audio, sr)
             tts_results.append({

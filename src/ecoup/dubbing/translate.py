@@ -47,6 +47,13 @@ class DubbingTranslator:
     def __init__(self, config: Optional[TranslationConfig] = None, api_key: Optional[str] = None):
         self.config = config or TranslationConfig()
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
+        if not self.api_key:
+            colab_key_p = Path("/content/.gemini_key")
+            if colab_key_p.exists():
+                try:
+                    self.api_key = colab_key_p.read_text(encoding="utf-8").strip()
+                except Exception:
+                    pass
 
         if not self.api_key and not self.config.mock:
             # Check secret Colab key location
@@ -116,24 +123,44 @@ class DubbingTranslator:
         if context_notes:
             system_instruction += f"\nNgữ cảnh phim: {context_notes}"
 
-        # 1. First translation pass
-        resp = client.models.generate_content(
-            model=self.config.model,
-            contents=f"Dịch danh sách câu sau sang tiếng Việt lồng tiếng:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}",
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                response_mime_type="application/json",
-                temperature=self.config.temperature,
-            ),
-        )
-
+        # 1. First translation pass in batches of 25 segments
         translated_map: dict[int, str] = {}
-        try:
-            items = json.loads(resp.text)
-            for it in items:
-                translated_map[int(it["id"])] = it.get("vi_text", "").strip()
-        except Exception:
-            pass
+        batch_size = 25
+
+        for b_idx in range(0, len(segments), batch_size):
+            batch = segments[b_idx : b_idx + batch_size]
+            prompt_payload = []
+            for s in batch:
+                budget = max(2, int(s.duration * self.config.syllables_per_second))
+                prompt_payload.append({
+                    "id": s.id,
+                    "speaker": s.speaker_id or "spk_0",
+                    "en": s.text,
+                    "duration_s": s.duration,
+                    "max_syllables_budget": budget,
+                })
+
+            config_args = {
+                "system_instruction": system_instruction,
+                "response_mime_type": "application/json",
+                "temperature": self.config.temperature,
+            }
+            if hasattr(types, "ThinkingConfig"):
+                config_args["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
+            resp = client.models.generate_content(
+                model=self.config.model,
+                contents=f"Dịch danh sách câu sau sang tiếng Việt lồng tiếng:\n{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}",
+                config=types.GenerateContentConfig(**config_args),
+            )
+
+            try:
+                items = json.loads(resp.text)
+                for it in items:
+                    val = it.get("vi_text") or it.get("vi") or it.get("vietnamese") or ""
+                    translated_map[int(it["id"])] = str(val).strip()
+            except Exception:
+                pass
 
         # 2. Check budgets and rewrite if overflowed
         results: list[TranslatedDubSegment] = []
@@ -176,14 +203,18 @@ class DubbingTranslator:
                 "Trả về JSON Array: id, vi_text."
             )
             try:
+                rw_args = {
+                    "system_instruction": system_instruction,
+                    "response_mime_type": "application/json",
+                    "temperature": 0.2,
+                }
+                if hasattr(types, "ThinkingConfig"):
+                    rw_args["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+
                 rw_resp = client.models.generate_content(
                     model=self.config.model,
                     contents=rewrite_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        response_mime_type="application/json",
-                        temperature=0.2,
-                    ),
+                    config=types.GenerateContentConfig(**rw_args),
                 )
                 rw_items = json.loads(rw_resp.text)
                 for it in rw_items:

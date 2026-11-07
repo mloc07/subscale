@@ -18,6 +18,15 @@ Hệ thống AI Super-Resolution cho Video tiết kiệm VRAM và kiểm soát n
 - **Checkpoint & Resume theo phân đoạn**: Tự động lưu tiến độ định kỳ (mặc định mỗi 300 khung) vào file `state.json`. Khi bị ngắt quãng (hoặc Colab timeout), hệ thống tiếp tục xử lý chính xác từ khung gián đoạn mà không làm mất thời gian hay lệch tiếng.
 - **NVENC Hardware Acceleration**: Tận dụng nhân mã hóa phần cứng của card đồ họa NVIDIA để xuất video thành phẩm tốc độ cao.
 - **Tạo & Gắn phụ đề tự động (Subtitle Pipeline - Whisper + Gemini)**: Tự động trích xuất âm thanh, nhận diện tiếng nói đa ngôn ngữ siêu tốc bằng `faster-whisper` (hỗ trợ `large-v3`, `medium`, `small`, `base` trên CUDA/CPU), dịch thuật ngữ cảnh tự nhiên bằng Google Gemini (`gemini-2.5-flash` / `gemini-3.1-flash-lite`), tự động ngắt dòng thông minh (CPL ≤ 42, CPS ≤ 17), xuất phụ đề chuẩn `.srt` / `.ass` (kèm Noto Sans/Arial styling) và burn-in trực tiếp vào video bằng FFmpeg `libass`. Tự động giải phóng 100% VRAM ngay sau ASR để không xung đột với mô hình upscale.
+- **Lồng tiếng Đa nhân vật Tự động (AI Multi-Speaker Dubbing Studio - S0 -> S9)**:
+  - Tách vocal và nhạc nền chuẩn 44.1kHz bằng Demucs (`htdemucs`).
+  - Nhận diện lời thoại đa ngôn ngữ bằng Faster-Whisper (Large-v3/Medium/Small) kèm lọc ảo giác (hallucination filter).
+  - Phân cụm và nhận diện giọng nhân vật tự động (Speaker Diarization) bằng SpeechBrain ECAPA-TDNN 192-dim không yêu cầu token HuggingFace, tự động chấm điểm độ tinh sạch giọng thoại (SNR + Flatness).
+  - Dịch thuật kiểm soát ngân sách thời lượng âm tiết (Syllable-Budget Aware Translation) bằng Google Gemini (`gemini-2.5-flash`), tự động viết lại nếu vượt thời lượng thoại gốc (ngưỡng 3.8 âm tiết/giây).
+  - Tổng hợp giọng nói tiếng Việt đa dạng nhân vật bằng `gTTS` kèm Pitch-shift timbral warping hoặc zero-shot voice cloning bằng `F5-TTS` (`danhtran2mind/Vi-F5-TTS`).
+  - Tự động co giãn thời lượng chuẩn (atempo snapping $\le$ 1.25x).
+  - Hòa âm thông minh: BGM Ducking -8dB với đường cong chuyển tiếp 50ms mượt mà, chuẩn hóa âm lượng và Peak Limiter chống rè (0.95 max).
+  - Xuất video chuẩn Stream Copy (`-c:v copy`) không nén lại hình ảnh, không chèn watermark hay metadata cưỡng bức, xuất kèm file phụ đề SRT song hành.
 
 ---
 
@@ -60,10 +69,13 @@ pip install -e .
 
 # Hoặc cài đặt đầy đủ kèm tính năng Phụ đề tự động (faster-whisper, google-genai, pysubs2...)
 pip install -e ".[subtitle]"
+
+# Cài đặt đầy đủ tính năng Lồng tiếng Đa nhân vật (Demucs, SpeechBrain, gTTS...)
+pip install -e ".[dubbing]"
 ```
 
 ### Thiết lập API Key cho Dịch thuật (Gemini)
-Để sử dụng tính năng dịch phụ đề tự động bằng Google Gemini, thiết lập biến môi trường `GEMINI_API_KEY`:
+Để sử dụng tính năng dịch phụ đề và lồng tiếng tự động bằng Google Gemini, thiết lập biến môi trường `GEMINI_API_KEY`:
 ```powershell
 # Trên Windows PowerShell
 $env:GEMINI_API_KEY="AIzaSy..."
@@ -86,12 +98,13 @@ Chạy ứng dụng Gradio tương thích hoàn toàn với Google Colab, hỗ t
 ```bash
 python colab_app.py --share
 ```
-*Giao diện tích hợp 2 tab chuyên biệt:*
+*Giao diện tích hợp 3 tab chuyên biệt:*
 - **⚡ Phục chế & Siêu phân giải (Upscale AI)**: Đầy đủ các thanh trượt điều chỉnh: Denoise, Detail Recovery, Sharpen, Film Grain, lựa chọn mô hình SeedVR2/CCSR/NomosUni, và nút Hủy an toàn.
 - **📝 Phụ đề tự động (Whisper + Gemini)**: Nhận diện tiếng nói tự động, dịch ngữ cảnh sang tiếng Việt (hoặc ngôn ngữ tùy chọn), xuất file `.srt`, `.ass` và video đã burn-in phụ đề chuẩn Noto Sans.
+- **🎙️ Lồng tiếng AI (Multi-Speaker Dubbing Studio)**: Tự động tách thoại & nhạc nền (Demucs), phân vai nhân vật (SpeechBrain), dịch khớp thời lượng (Gemini 2.5 Flash), tổng hợp giọng đọc tiếng Việt theo nhân vật (gTTS / F5-TTS) và hòa âm Ducking BGM chuyên nghiệp.
 
 ### 4.2. Giao diện Desktop (PyQt6)
-Dành cho máy tính cá nhân cục bộ, tích hợp cả 2 tab Upscale và Subtitle với luồng worker nền không gây đơ UI:
+Dành cho máy tính cá nhân cục bộ, tích hợp cả 3 tab Upscale, Subtitle và Dubbing với luồng worker nền không gây đơ UI:
 ```powershell
 python -m gui.main_window
 ```
@@ -120,6 +133,21 @@ python -m ecoup.cli subtitle -i video.mp4 --no-translate --no-burn
 
 # Tùy chọn model Whisper (medium/large-v3) và font chữ
 python -m ecoup.cli subtitle -i video.mp4 -o video_sub.mp4 --whisper-model medium --font-name "Noto Sans" --font-size 22
+```
+
+#### Lồng tiếng Đa nhân vật Tự động (Dubbing)
+```powershell
+# Lồng tiếng tự động toàn bộ quy trình (S0 -> S9) bằng gTTS
+python -m ecoup.cli dub -i video.mp4 --backend gtts --whisper-model large-v3
+
+# Lồng tiếng với F5-TTS Voice Cloning (chất lượng cao trên GPU)
+python -m ecoup.cli dub -i video.mp4 --backend f5 --whisper-model large-v3
+
+# Cung cấp bối cảnh dịch thuật & xưng hô nhân vật
+python -m ecoup.cli dub -i video.mp4 --context "Phim sitcom, nhân vật chính Peter Griffin hài hước mỉa mai"
+
+# Chạy kiểm thử từng bước riêng lẻ (S1: Demucs, S2: Whisper, S3: Diarization, S5: Dịch, S8: Trộn)
+python -m ecoup.cli dub -i video.mp4 --step s1
 ```
 
 ---

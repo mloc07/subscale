@@ -67,6 +67,7 @@ from ecoup.video_io import get_video_metadata
 # Global tracker for cancel functionality and engine cache
 active_pipeline: Optional[UpscalePipeline] = None
 active_subtitle_pipeline = None
+active_dubbing_pipeline = None
 _GLOBAL_ENGINE = None
 _GLOBAL_ENGINE_KEY: Optional[str] = None
 
@@ -141,6 +142,15 @@ def cancel_subtitle():
         active_subtitle_pipeline.cancel()
         return "⏹️ Đã gửi lệnh hủy tiến trình phụ đề."
     return "Không có tiến trình phụ đề nào đang chạy."
+
+
+def cancel_dubbing():
+    """Cancel currently running dubbing job."""
+    global active_dubbing_pipeline
+    if active_dubbing_pipeline is not None:
+        active_dubbing_pipeline.cancel()
+        return "⏹️ Đã gửi lệnh hủy tiến trình lồng tiếng."
+    return "Không có tiến trình lồng tiếng nào đang chạy."
 
 
 def inspect_video(file_path: Optional[str]) -> str:
@@ -739,6 +749,91 @@ def run_subtitle(
     )
 
 
+def run_dubbing(
+    input_file_path: Optional[str],
+    tts_backend_choice: str,
+    whisper_model_choice: str,
+    gemini_model_choice: str,
+    num_speakers_choice: str,
+    context_note_input: str,
+    api_key_input: str = "",
+    progress=gr.Progress(track_tqdm=False),
+):
+    """Execute AI Multi-Speaker Dubbing pipeline (S0 -> S9)."""
+    global active_dubbing_pipeline
+    if not input_file_path or not os.path.exists(input_file_path):
+        raise gr.Error("Vui lòng chọn video đầu vào hợp lệ.")
+
+    resolved_key = (api_key_input or "").strip()
+    if not resolved_key:
+        resolved_key = os.environ.get("GEMINI_API_KEY", "")
+    if not resolved_key and os.path.exists("/content/.gemini_key"):
+        try:
+            resolved_key = Path("/content/.gemini_key").read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+
+    if resolved_key:
+        os.environ["GEMINI_API_KEY"] = resolved_key
+
+    from ecoup.dubbing.config import DubbingConfig
+    from ecoup.dubbing.pipeline import DubbingPipeline
+
+    in_p = Path(input_file_path)
+    out_dir = in_p.parent / f"dub_project_{in_p.stem}"
+
+    cfg = DubbingConfig(project_dir=str(out_dir))
+    cfg.tts.backend = "gtts" if "Google" in tts_backend_choice else ("f5" if "F5" in tts_backend_choice else "mock")
+    cfg.asr.model_size = whisper_model_choice
+    cfg.translation.model = gemini_model_choice
+
+    if num_speakers_choice and num_speakers_choice.isdigit():
+        cfg.diarization.num_speakers = int(num_speakers_choice)
+    else:
+        cfg.diarization.num_speakers = None
+
+    step_map = {
+        "S0": ("Tiếp nhận & kiểm tra luồng âm thanh...", 0.05),
+        "S1": ("Tách lời thoại & nhạc nền (Demucs 44.1kHz)...", 0.20),
+        "S2": ("Nhận dạng giọng nói (Faster-Whisper)...", 0.40),
+        "S3": ("Nhận diện & phân cụm nhân vật (SpeechBrain)...", 0.55),
+        "S4": ("Trích xuất mẫu giọng sạch từng nhân vật...", 0.65),
+        "S5": ("Dịch thuật có ngân sách thời lượng (Gemini)...", 0.75),
+        "S6": ("Tổng hợp giọng tiếng Việt theo nhân vật...", 0.85),
+        "S7": ("Khớp thời lượng từng câu thoại...", 0.92),
+        "S8": ("Trộn âm thanh thoại & Ducking nhạc nền...", 0.96),
+        "S9": ("Ghép âm thanh vào video (Stream copy)...", 0.99),
+    }
+
+    def on_dub_progress(step: str, frac: float):
+        desc, base_pct = step_map.get(step, (f"Đang xử lý {step}...", 0.5))
+        progress(base_pct, desc=desc)
+
+    pipe = DubbingPipeline(input_file_path, config=cfg, on_progress=on_dub_progress)
+    active_dubbing_pipeline = pipe
+
+    try:
+        progress(0.02, desc="Khởi động pipeline lồng tiếng...")
+        res = pipe.run_full_pipeline(context_notes=context_note_input)
+    except Exception as e:
+        if pipe._cancelled:
+            return None, None, None, None, "⏹️ Tiến trình lồng tiếng đã được hủy thành công."
+        raise gr.Error(f"Lỗi lồng tiếng: {e}") from e
+    finally:
+        active_dubbing_pipeline = None
+
+    final_vid = res.get("video_path")
+    final_srt = res.get("srt_path")
+
+    preview_audio = None
+    spk0_prev = out_dir / "voices" / "spk_0" / "preview.wav"
+    if spk0_prev.exists():
+        preview_audio = str(spk0_prev)
+
+    status_msg = f"🎉 Hoàn tất lồng tiếng AI! Tổng thời gian: {res.get('total_elapsed_s', 0)}s."
+    return final_vid, final_vid, final_srt, preview_audio, status_msg
+
+
 def create_ui():
     """Create clean, modern Gradio interface."""
     custom_css = """
@@ -1239,6 +1334,104 @@ def create_ui():
                     fn=cancel_subtitle,
                     outputs=[sub_status_tb],
                     cancels=[sub_run_event, sub_preview_event, sub_from_preview_event],
+                )
+
+            with gr.Tab("🎙️ Lồng tiếng AI (Multi-Speaker Dubbing)"):
+                with gr.Row():
+                    # ================= LEFT COLUMN: INPUTS =================
+                    with gr.Column(scale=6):
+                        with gr.Group():
+                            gr.Markdown("### 1. Tệp video nguồn")
+                            dub_in_file = gr.File(
+                                label="Kéo thả hoặc chọn video (MP4, MKV, MOV, WebM)",
+                                file_types=["video"],
+                                type="filepath",
+                            )
+
+                        with gr.Group():
+                            gr.Markdown("### 2. Cấu hình Giọng nói & Nhận dạng")
+                            with gr.Row():
+                                dub_tts_backend_dd = gr.Dropdown(
+                                    label="Bộ sinh giọng tiếng Việt (TTS)",
+                                    choices=["Google Cloud / gTTS (Phát âm chuẩn 100%)", "F5-TTS (Zero-shot Voice Clone AI)"],
+                                    value="Google Cloud / gTTS (Phát âm chuẩn 100%)",
+                                )
+                                dub_whisper_dd = gr.Dropdown(
+                                    label="Mô hình Whisper ASR",
+                                    choices=["base", "small", "medium", "large-v3"],
+                                    value="base",
+                                )
+                            with gr.Row():
+                                dub_num_spk_dd = gr.Dropdown(
+                                    label="Số nhân vật",
+                                    choices=["Tự động phát hiện (Auto)", "1", "2", "3", "4", "5"],
+                                    value="Tự động phát hiện (Auto)",
+                                )
+                                dub_gemini_dd = gr.Dropdown(
+                                    label="Mô hình Dịch thuật",
+                                    choices=["gemini-2.5-flash", "gemini-1.5-flash"],
+                                    value="gemini-2.5-flash",
+                                )
+
+                        with gr.Group():
+                            gr.Markdown("### 3. Ngữ cảnh & API Key")
+                            dub_context_tb = gr.Textbox(
+                                label="Ghi chú ngữ cảnh / Bối cảnh phim (tùy chọn)",
+                                placeholder="Ví dụ: Phim hoạt hình hài hước, xưng hô anh/em, văn phong tự nhiên...",
+                                lines=2,
+                            )
+                            dub_api_key_tb = gr.Textbox(
+                                label="Google Gemini API Key (tự động đọc nếu đã nạp)",
+                                placeholder="Nhập API Key nếu chưa lưu trên máy...",
+                                type="password",
+                            )
+
+                        with gr.Row():
+                            btn_dub_run = gr.Button("🚀 Bắt đầu Lồng tiếng (1-Click)", variant="primary", scale=2)
+                            btn_dub_cancel = gr.Button("⏹️ Hủy tiến trình", variant="stop", scale=1)
+
+                    # ================= RIGHT COLUMN: OUTPUTS =================
+                    with gr.Column(scale=6):
+                        with gr.Group():
+                            gr.Markdown("### 🎬 Video Lồng tiếng Thành phẩm")
+                            dub_out_video = gr.Video(label="Xem trước video lồng tiếng", interactive=False)
+                            dub_status_tb = gr.Textbox(label="Trạng thái & Tiến độ", interactive=False, lines=2)
+
+                        with gr.Group():
+                            gr.Markdown("### 📥 Tải kết quả về máy")
+                            with gr.Row():
+                                dub_dl_video = gr.File(label="Tải Video (.mp4)")
+                                dub_dl_srt = gr.File(label="Tải Phụ đề (.srt)")
+                            dub_preview_audio = gr.Audio(label="Mẫu giọng nhân vật chính (Clean Reference Voice)", interactive=False)
+
+                dub_inputs = [
+                    dub_in_file,
+                    dub_tts_backend_dd,
+                    dub_whisper_dd,
+                    dub_gemini_dd,
+                    dub_num_spk_dd,
+                    dub_context_tb,
+                    dub_api_key_tb,
+                ]
+
+                dub_outputs = [
+                    dub_out_video,
+                    dub_dl_video,
+                    dub_dl_srt,
+                    dub_preview_audio,
+                    dub_status_tb,
+                ]
+
+                dub_run_event = btn_dub_run.click(
+                    fn=run_dubbing,
+                    inputs=dub_inputs,
+                    outputs=dub_outputs,
+                )
+
+                btn_dub_cancel.click(
+                    fn=cancel_dubbing,
+                    outputs=[dub_status_tb],
+                    cancels=[dub_run_event],
                 )
 
     return demo

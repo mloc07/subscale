@@ -22,12 +22,17 @@ from .asr import DubbingSegment, load_wav_float32
 class DiarizationOptions:
     num_speakers: Optional[int] = None
     min_speakers: int = 1
-    max_speakers: int = 10
-    distance_threshold: float = 0.45  # Cosine distance threshold (1 - cos_sim)
+    max_speakers: int = 6
+    distance_threshold: float = 0.50  # Cosine distance threshold (1 - cos_sim)
     mock: bool = False
 
 
-def _cluster_pure_numpy(emb_matrix: np.ndarray, distance_threshold: float, num_speakers: Optional[int] = None) -> list[int]:
+def _cluster_pure_numpy(
+    emb_matrix: np.ndarray,
+    distance_threshold: float,
+    num_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = 6,
+) -> list[int]:
     """Greedy clustering on cosine distance using pure numpy (no scipy/sklearn dependency needed)."""
     n = len(emb_matrix)
     if n <= 1:
@@ -51,9 +56,10 @@ def _cluster_pure_numpy(emb_matrix: np.ndarray, distance_threshold: float, num_s
                 clusters[c_idx].append(j)
                 assigned[j] = c_idx
 
-    # If num_speakers is specified and we have too many clusters, merge closest
-    if num_speakers is not None and len(clusters) > num_speakers:
-        while len(clusters) > num_speakers:
+    target_k = num_speakers or max_speakers
+    # If num_speakers or max_speakers is specified and we have too many clusters, merge closest
+    if target_k is not None and len(clusters) > target_k:
+        while len(clusters) > target_k:
             # Find two clusters with minimum distance
             min_d = 999.0
             best_pair = (0, 1)
@@ -183,12 +189,17 @@ class SpeakerDiarizer:
                     cluster_labels = fcluster(Z, t=k, criterion="maxclust") - 1
                 else:
                     cluster_labels = fcluster(Z, t=self.options.distance_threshold, criterion="distance") - 1
+                    n_found = len(set(cluster_labels))
+                    if self.options.max_speakers and n_found > self.options.max_speakers:
+                        k = min(self.options.max_speakers, num_samples)
+                        cluster_labels = fcluster(Z, t=k, criterion="maxclust") - 1
             except Exception:
                 # Fallback to pure numpy clustering
                 cluster_labels = _cluster_pure_numpy(
                     emb_matrix,
                     distance_threshold=self.options.distance_threshold,
                     num_speakers=self.options.num_speakers,
+                    max_speakers=self.options.max_speakers,
                 )
 
         # Map labels back to segments

@@ -251,6 +251,62 @@ class SubtitleWorker(QThread):
             self.pipeline.cancel()
 
 
+class DubbingWorker(QThread):
+    """Background worker thread for running the multi-speaker dubbing pipeline."""
+    progress_sig = pyqtSignal(str, float)
+    log_sig = pyqtSignal(str)
+    finished_sig = pyqtSignal(bool, dict, str)
+
+    def __init__(self, config, input_path: str, context_notes: str = "", target_step: Optional[str] = None):
+        super().__init__()
+        self.config = config
+        self.input_path = input_path
+        self.context_notes = context_notes
+        self.target_step = target_step
+        self.pipeline = None
+
+    def run(self):
+        try:
+            from ecoup.dubbing.pipeline import DubbingPipeline
+
+            step_names = {
+                "S0": "Kiểm tra âm thanh",
+                "S1": "Tách nhạc nền & thoại (Demucs)",
+                "S2": "Nhận dạng giọng nói (Whisper)",
+                "S3": "Phân vai nhân vật (SpeechBrain)",
+                "S4": "Trích xuất mẫu giọng chuẩn",
+                "S5": "Dịch thuật khớp thời lượng (Gemini)",
+                "S6": "Tổng hợp tiếng Việt (TTS)",
+                "S7": "Khớp thời lượng (Snapping)",
+                "S8": "Trộn âm & Ducking nhạc nền",
+                "S9": "Ghép video đầu ra",
+            }
+
+            def on_progress(step: str, frac: float):
+                name = step_names.get(step, step)
+                self.progress_sig.emit(step, frac)
+                self.log_sig.emit(f"[Lồng tiếng - {name}] Bước {step} ({int(frac * 100)}%)")
+
+            self.pipeline = DubbingPipeline(self.input_path, config=self.config, on_progress=on_progress)
+            self.log_sig.emit(f"Bắt đầu quy trình lồng tiếng cho: {Path(self.input_path).name}")
+
+            if self.target_step:
+                res = self.pipeline.run_step(self.target_step, context_notes=self.context_notes)
+            else:
+                res = self.pipeline.run_full_pipeline(context_notes=self.context_notes)
+
+            if getattr(self.pipeline, "_cancelled", False):
+                self.finished_sig.emit(False, res, "Tiến trình lồng tiếng đã bị hủy.")
+            else:
+                self.finished_sig.emit(True, res, "Hoàn tất lồng tiếng video thành công!")
+        except Exception as e:
+            self.finished_sig.emit(False, {}, str(e))
+
+    def cancel(self):
+        if self.pipeline:
+            self.pipeline.cancel()
+
+
 class MainWindow(QMainWindow):
     """Main window for Eco Video Upscaler & Subtitle Studio."""
 
@@ -262,9 +318,11 @@ class MainWindow(QMainWindow):
 
         self.worker: Optional[PipelineWorker] = None
         self.sub_worker: Optional[SubtitleWorker] = None
+        self.dub_worker: Optional[DubbingWorker] = None
         self.is_paused = False
         self.meta: Optional[VideoMetadata] = None
         self.sub_meta: Optional[VideoMetadata] = None
+        self.dub_meta: Optional[VideoMetadata] = None
 
         self._build_ui()
         self._init_hardware_info()
@@ -291,8 +349,10 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         upscale_tab = self._build_upscale_tab()
         subtitle_tab = self._build_subtitle_tab()
+        dubbing_tab = self._build_dubbing_tab()
         self.tabs.addTab(upscale_tab, "⚡ Nâng cấp Video (Upscale)")
         self.tabs.addTab(subtitle_tab, "📝 Phụ đề tự động (Subtitle)")
+        self.tabs.addTab(dubbing_tab, "🎙️ Lồng tiếng AI (Dubbing)")
         root_layout.addWidget(self.tabs)
 
         # 3. Real-time Console Log Box
@@ -692,6 +752,172 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return tab
 
+    def _build_dubbing_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(10)
+        layout.setContentsMargins(8, 10, 8, 8)
+
+        # 1. File Selection Panel
+        file_box = QWidget()
+        file_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        file_layout = QGridLayout(file_box)
+        file_layout.setContentsMargins(10, 10, 10, 10)
+        file_layout.setSpacing(8)
+
+        file_layout.addWidget(QLabel("Video vào:"), 0, 0)
+        self.dub_input_edit = QLineEdit()
+        self.dub_input_edit.setPlaceholderText("Chọn video nguồn cần lồng tiếng (.mp4, .mkv, .mov)...")
+        file_layout.addWidget(self.dub_input_edit, 0, 1)
+        browse_in_btn = QPushButton("Chọn...")
+        browse_in_btn.clicked.connect(self._browse_dub_input)
+        file_layout.addWidget(browse_in_btn, 0, 2)
+
+        file_layout.addWidget(QLabel("Thư mục dự án:"), 1, 0)
+        self.dub_project_edit = QLineEdit()
+        self.dub_project_edit.setPlaceholderText("Thư mục lưu artifacts (mặc định: dub_project_<tên_video>)...")
+        file_layout.addWidget(self.dub_project_edit, 1, 1)
+        browse_out_btn = QPushButton("Chọn...")
+        browse_out_btn.clicked.connect(self._browse_dub_project)
+        file_layout.addWidget(browse_out_btn, 1, 2)
+
+        self.dub_meta_label = QLabel("Chưa chọn video")
+        self.dub_meta_label.setStyleSheet("color: #71717a; font-family: monospace; font-size: 11px;")
+        file_layout.addWidget(self.dub_meta_label, 2, 1, 1, 2)
+        layout.addWidget(file_box)
+
+        # 2. Settings Panel
+        settings_box = QWidget()
+        settings_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        set_layout = QVBoxLayout(settings_box)
+        set_layout.setContentsMargins(10, 10, 10, 10)
+        set_layout.setSpacing(8)
+
+        row1 = QHBoxLayout()
+        row1.setSpacing(10)
+
+        t_col = QVBoxLayout()
+        t_col.addWidget(QLabel("Bộ tổng hợp giọng nói (TTS):"))
+        self.dub_backend_combo = QComboBox()
+        self.dub_backend_combo.addItems([
+            "Google TTS (gTTS - Ổn định, tự nhiên, đa âm điệu)",
+            "F5-TTS Vietnamese (Clone giọng mẫu - Yêu cầu GPU)",
+            "Mock (Chạy thử nghiệm nhanh)",
+        ])
+        t_col.addWidget(self.dub_backend_combo)
+        row1.addLayout(t_col)
+
+        w_col = QVBoxLayout()
+        w_col.addWidget(QLabel("Mô hình Whisper ASR:"))
+        self.dub_whisper_combo = QComboBox()
+        self.dub_whisper_combo.addItems([
+            "large-v3 (Độ chính xác cao nhất - Khuyên dùng)",
+            "medium",
+            "small",
+            "base",
+        ])
+        w_col.addWidget(self.dub_whisper_combo)
+        row1.addLayout(w_col)
+
+        g_col = QVBoxLayout()
+        g_col.addWidget(QLabel("Mô hình Dịch thuật (Gemini):"))
+        self.dub_gemini_combo = QComboBox()
+        self.dub_gemini_combo.addItems([
+            "gemini-2.5-flash (Khuyên dùng - Cân bằng & khớp số âm tiết)",
+            "gemini-2.5-pro (Dịch sâu bối cảnh)",
+            "gemini-2.0-flash",
+        ])
+        g_col.addWidget(self.dub_gemini_combo)
+        row1.addLayout(g_col)
+        set_layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+
+        spk_col = QVBoxLayout()
+        spk_col.addWidget(QLabel("Số lượng nhân vật (Speakers):"))
+        self.dub_spk_combo = QComboBox()
+        self.dub_spk_combo.addItems([
+            "Tự động phát hiện (SpeechBrain ECAPA-TDNN)",
+            "1 nhân vật",
+            "2 nhân vật",
+            "3 nhân vật",
+            "4 nhân vật",
+        ])
+        spk_col.addWidget(self.dub_spk_combo)
+        row2.addLayout(spk_col)
+
+        step_col = QVBoxLayout()
+        step_col.addWidget(QLabel("Chạy đến bước (Target Step):"))
+        self.dub_step_combo = QComboBox()
+        self.dub_step_combo.addItems([
+            "Toàn bộ quy trình (S0 -> S9)",
+            "S1 - Tách Demucs",
+            "S2 - Nhận dạng Faster-Whisper",
+            "S3 - Phân cụm Diarization",
+            "S4 - Trích xuất Voice Profile",
+            "S5 - Dịch Gemini khớp thời lượng",
+            "S6 - Tổng hợp TTS tiếng Việt",
+            "S7 - Khớp thời lượng Snapping",
+            "S8 - Trộn âm & Ducking",
+        ])
+        step_col.addWidget(self.dub_step_combo)
+        row2.addLayout(step_col)
+
+        k_col = QVBoxLayout()
+        k_col.addWidget(QLabel("Gemini API Key (hoặc biến môi trường):"))
+        self.dub_api_key_edit = QLineEdit()
+        self.dub_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.dub_api_key_edit.setPlaceholderText("Nhập khóa API (để trống nếu đã có biến môi trường)...")
+        k_col.addWidget(self.dub_api_key_edit)
+        row2.addLayout(k_col)
+        set_layout.addLayout(row2)
+
+        c_col = QVBoxLayout()
+        c_col.addWidget(QLabel("Ghi chú ngữ cảnh dịch thuật (Tính cách nhân vật, bối cảnh, xưng hô):"))
+        self.dub_context_edit = QLineEdit()
+        self.dub_context_edit.setPlaceholderText("Ví dụ: Peter Griffin nói hài hước mỉa mai; xưng hô thân mật Peter/Lois...")
+        c_col.addWidget(self.dub_context_edit)
+        set_layout.addLayout(c_col)
+        layout.addWidget(settings_box)
+
+        # 3. Progress Box
+        prog_box = QWidget()
+        prog_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px;")
+        prog_layout = QVBoxLayout(prog_box)
+        prog_layout.setContentsMargins(10, 10, 10, 10)
+        prog_layout.setSpacing(6)
+
+        self.dub_prog_text = QLabel("Tiến độ: Sẵn sàng")
+        prog_layout.addWidget(self.dub_prog_text)
+
+        self.dub_progress_bar = QProgressBar()
+        self.dub_progress_bar.setRange(0, 100)
+        self.dub_progress_bar.setValue(0)
+        prog_layout.addWidget(self.dub_progress_bar)
+
+        btn_line = QHBoxLayout()
+        self.dub_start_btn = QPushButton("Bắt đầu Lồng tiếng")
+        self.dub_start_btn.setObjectName("primaryBtn")
+        self.dub_start_btn.clicked.connect(self._start_dubbing)
+        btn_line.addWidget(self.dub_start_btn)
+
+        self.dub_cancel_btn = QPushButton("Hủy")
+        self.dub_cancel_btn.setObjectName("dangerBtn")
+        self.dub_cancel_btn.setEnabled(False)
+        self.dub_cancel_btn.clicked.connect(self._cancel_dubbing)
+        btn_line.addWidget(self.dub_cancel_btn)
+
+        btn_line.addStretch()
+        open_dub_folder_btn = QPushButton("Mở thư mục dự án")
+        open_dub_folder_btn.clicked.connect(self._open_dub_folder)
+        btn_line.addWidget(open_dub_folder_btn)
+        prog_layout.addLayout(btn_line)
+        layout.addWidget(prog_box)
+
+        layout.addStretch()
+        return tab
+
     def _init_hardware_info(self):
         """Read initial hardware telemetry."""
         gpu = check_gpu()
@@ -992,6 +1218,143 @@ class MainWindow(QMainWindow):
     def _open_sub_folder(self):
         out_file = self.sub_output_edit.text().strip()
         folder = Path(out_file).parent if out_file else Path.cwd()
+        if folder.exists():
+            os.startfile(folder)
+
+    # ================= DUBBING EVENT HANDLERS =================
+    def _browse_dub_input(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Chọn Video Cần Lồng Tiếng", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.webm)"
+        )
+        if file:
+            self.dub_input_edit.setText(file)
+            try:
+                self.dub_meta = get_video_metadata(file)
+                self.dub_meta_label.setText(
+                    f"Gốc: {self.dub_meta.width}x{self.dub_meta.height} • Audio: {'Có' if self.dub_meta.has_audio else 'Không'} • {self.dub_meta.duration_sec:.1f}s"
+                )
+                p = Path(file)
+                default_proj = str(p.parent / f"dub_project_{p.stem}")
+                self.dub_project_edit.setText(default_proj)
+            except Exception as e:
+                self.dub_meta_label.setText(f"Lỗi đọc metadata: {e}")
+
+    def _browse_dub_project(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Chọn Thư Mục Dự Án Lồng Tiếng", self.dub_project_edit.text() or ""
+        )
+        if folder:
+            self.dub_project_edit.setText(folder)
+
+    def _start_dubbing(self):
+        in_file = self.dub_input_edit.text().strip()
+        proj_dir = self.dub_project_edit.text().strip()
+
+        if not in_file or not os.path.exists(in_file):
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn video đầu vào hợp lệ.")
+            return
+
+        api_key = self.dub_api_key_edit.text().strip()
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
+
+        from ecoup.dubbing.config import DubbingConfig
+
+        if not proj_dir:
+            p = Path(in_file)
+            proj_dir = str(p.parent / f"dub_project_{p.stem}")
+
+        cfg = DubbingConfig(project_dir=proj_dir)
+
+        backend_text = self.dub_backend_combo.currentText().lower()
+        if "google" in backend_text or "gtts" in backend_text:
+            cfg.tts.backend = "gtts"
+        elif "f5" in backend_text:
+            cfg.tts.backend = "f5"
+        else:
+            cfg.tts.backend = "mock"
+
+        cfg.asr.model_size = self.dub_whisper_combo.currentText().split()[0].strip()
+        cfg.translation.model = self.dub_gemini_combo.currentText().split()[0].strip()
+
+        spk_text = self.dub_spk_combo.currentText()
+        if "1" in spk_text:
+            cfg.diarization.num_speakers = 1
+        elif "2" in spk_text:
+            cfg.diarization.num_speakers = 2
+        elif "3" in spk_text:
+            cfg.diarization.num_speakers = 3
+        elif "4" in spk_text:
+            cfg.diarization.num_speakers = 4
+        else:
+            cfg.diarization.num_speakers = None
+
+        step_text = self.dub_step_combo.currentText()
+        target_step = None
+        if not step_text.startswith("Toàn bộ"):
+            target_step = step_text.split()[0].strip()
+
+        context_notes = self.dub_context_edit.text().strip()
+
+        self.dub_start_btn.setEnabled(False)
+        self.dub_cancel_btn.setEnabled(True)
+        self.status_badge.setText("Đang lồng tiếng AI")
+        self.status_badge.setStyleSheet("color: #3b82f6; font-weight: 500;")
+
+        self.dub_worker = DubbingWorker(
+            config=cfg,
+            input_path=in_file,
+            context_notes=context_notes,
+            target_step=target_step,
+        )
+        self.dub_worker.progress_sig.connect(self._on_dub_worker_progress)
+        self.dub_worker.log_sig.connect(self.log_box.append)
+        self.dub_worker.finished_sig.connect(self._on_dub_worker_finished)
+        self.dub_worker.start()
+
+    def _on_dub_worker_progress(self, step: str, frac: float):
+        step_map = {
+            "S0": ("Tiếp nhận & kiểm tra âm thanh", 5),
+            "S1": ("Tách nhạc nền & thoại (Demucs)", 20),
+            "S2": ("Nhận dạng giọng nói (Faster-Whisper)", 40),
+            "S3": ("Phân cụm nhân vật (SpeechBrain)", 55),
+            "S4": ("Trích xuất mẫu giọng từng nhân vật", 65),
+            "S5": ("Dịch thuật khớp thời lượng (Gemini)", 75),
+            "S6": ("Tổng hợp giọng tiếng Việt (TTS)", 85),
+            "S7": ("Khớp thời lượng từng câu (Snapping)", 92),
+            "S8": ("Trộn âm thanh & Ducking nhạc nền", 96),
+            "S9": ("Ghép âm thanh vào video (Stream copy)", 99),
+        }
+        desc, pct = step_map.get(step, (f"Đang xử lý {step}", int(frac * 100)))
+        self.dub_progress_bar.setValue(pct)
+        self.dub_prog_text.setText(f"Tiến độ ({desc}): {pct}%")
+
+    def _on_dub_worker_finished(self, success: bool, res: dict, message: str):
+        self.dub_start_btn.setEnabled(True)
+        self.dub_cancel_btn.setEnabled(False)
+        self.status_badge.setText("Sẵn sàng")
+        self.status_badge.setStyleSheet("color: #10b981; font-weight: 500;")
+        self.dub_progress_bar.setValue(100 if success else 0)
+
+        if success:
+            self.log_box.append(f"[Lồng tiếng thành công] {message}")
+            if res.get("video_path"):
+                self.log_box.append(f"  -> Video lồng tiếng: {res['video_path']}")
+            if res.get("srt_path"):
+                self.log_box.append(f"  -> Phụ đề SRT kèm theo: {res['srt_path']}")
+            QMessageBox.information(self, "Thành công", f"{message}\n\nVideo: {res.get('video_path', '')}")
+        else:
+            self.log_box.append(f"[Lồng tiếng lỗi] {message}")
+            QMessageBox.critical(self, "Lỗi lồng tiếng", message)
+
+    def _cancel_dubbing(self):
+        if self.dub_worker:
+            self.dub_worker.cancel()
+            self.log_box.append("[Hệ thống] Đang yêu cầu hủy tiến trình lồng tiếng...")
+
+    def _open_dub_folder(self):
+        proj_dir = self.dub_project_edit.text().strip()
+        folder = Path(proj_dir) if proj_dir else Path.cwd()
         if folder.exists():
             os.startfile(folder)
 
