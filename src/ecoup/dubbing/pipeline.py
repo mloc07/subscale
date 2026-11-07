@@ -20,7 +20,7 @@ from .mixing import mix_audio_tracks
 from .mux import export_srt_file, mux_video_with_audio
 from .snapping import align_audio_to_target_duration
 from .translate import DubbingTranslator, TranslatedDubSegment, TranslationConfig
-from .tts import F5VoiceBackend, GTTSVoiceBackend, MockVoiceBackend, VoiceBackend
+from .tts import F5VoiceBackend, GTTSVoiceBackend, MockVoiceBackend, OpenVoiceBackend, VoiceBackend
 from .voice_profile import VoiceProfile, build_voice_profiles
 
 
@@ -304,14 +304,17 @@ class DubbingPipeline:
         return translated_segs
 
     def _get_voice_backend(self) -> VoiceBackend:
-        b_name = self.config.tts.backend
+        b_name = (self.config.tts.backend or "").lower()
         if self.config.tts.mock or b_name == "mock":
             return MockVoiceBackend()
+        elif b_name in ("openvoice", "clone", "voice_clone"):
+            return OpenVoiceBackend(device=self.config.demucs.device)
         elif b_name == "gtts":
             return GTTSVoiceBackend(lang="vi")
         elif b_name == "f5":
             return F5VoiceBackend(device=self.config.demucs.device)
-        return MockVoiceBackend()
+        # Default to OpenVoice for real voice cloning if reference audio is available
+        return OpenVoiceBackend(device=self.config.demucs.device)
 
     def run_s6_tts(self) -> list[dict]:
         """S6: Synthesize Vietnamese voice for each translated segment."""
@@ -352,6 +355,7 @@ class DubbingPipeline:
             wav_file = self.tts_dir / f"seg_{s.id:04d}.wav"
             spk_prof = profiles.get(s.speaker_id)
             ref_path = self.project_dir / spk_prof.reference_wav if spk_prof else None
+            ref_text = getattr(spk_prof, "reference_text", None) or s.original_text
 
             audio, sr = backend.synthesize(
                 text=s.translated_text,
@@ -359,6 +363,7 @@ class DubbingPipeline:
                 speed=self.config.tts.default_speed,
                 target_duration=s.duration,
                 speaker_id=s.speaker_id,
+                ref_text=ref_text,
             )
             _write_wav_pcm16(wav_file, audio, sr)
             tts_results.append({

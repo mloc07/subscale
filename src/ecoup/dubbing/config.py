@@ -81,13 +81,14 @@ class TranslationDubbingConfig:
 
 @dataclass
 class TtsDubbingConfig:
-    backend: str = "f5"  # "f5", "gtts", "mock"
+    backend: str = "openvoice"  # "openvoice", "f5", "gtts", "mock"
     default_speed: float = 1.0
-    max_speedup: float = 1.25
+    max_speedup: float = 1.35
     mock: bool = False
 
     def validate(self) -> None:
-        if self.backend not in ("f5", "gtts", "mock"):
+        valid_backends = ("openvoice", "clone", "f5", "gtts", "mock")
+        if self.backend not in valid_backends:
             raise ValueError(f"Unsupported TTS backend: {self.backend}")
 
 

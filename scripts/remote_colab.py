@@ -14,7 +14,7 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-DEFAULT_BRIDGE_URL = "https://conservative-drill-third-collections.trycloudflare.com/"
+DEFAULT_BRIDGE_URL = "https://subsection-old-none-bidding.trycloudflare.com/"
 
 def get_bridge_url() -> str:
     return os.environ.get("COLAB_BRIDGE_URL", DEFAULT_BRIDGE_URL)

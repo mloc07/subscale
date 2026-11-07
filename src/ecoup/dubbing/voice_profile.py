@@ -25,6 +25,7 @@ class VoiceProfile:
     total_segments: int
     speaking_duration_s: float
     flags: list[str] = field(default_factory=list)
+    reference_text: str = ""
 
 
 def calculate_audio_quality(audio: np.ndarray, sr: int = 16000) -> tuple[float, list[str]]:
@@ -111,15 +112,20 @@ def build_voice_profiles(
 
         # Select best segment or combine 2 short segments
         selected_audio_chunks: list[np.ndarray] = []
+        selected_texts: list[str] = []
         cur_dur = 0.0
         for cand in candidates:
             st = int(cand.start * sr_load)
             et = int(cand.end * sr_load)
             chunk = full_audio[st:et]
             selected_audio_chunks.append(chunk)
+            if cand.text and cand.text.strip():
+                selected_texts.append(cand.text.strip())
             cur_dur += cand.duration
             if cur_dur >= 4.0:
                 break
+
+        ref_prompt_text = " ".join(selected_texts)
 
         if selected_audio_chunks:
             combined = np.concatenate(selected_audio_chunks)
@@ -143,6 +149,7 @@ def build_voice_profiles(
             total_segments=len(segs),
             speaking_duration_s=total_dur,
             flags=flags,
+            reference_text=ref_prompt_text,
         )
 
         # Save profile.json

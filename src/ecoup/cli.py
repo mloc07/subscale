@@ -276,7 +276,7 @@ def main(args: Optional[list[str]] = None) -> int:
     dub_parser = subparsers.add_parser("dub", help="AI Multi-speaker Dubbing into Vietnamese")
     dub_parser.add_argument("-i", "--input", required=True, help="Path to input video")
     dub_parser.add_argument("-o", "--project-dir", help="Project directory (default: <input_dir>/dub_project_<stem>)")
-    dub_parser.add_argument("--backend", default="gtts", choices=["gtts", "f5", "mock"], help="TTS Voice backend")
+    dub_parser.add_argument("--backend", default="openvoice", choices=["openvoice", "clone", "f5", "gtts", "mock"], help="TTS Voice backend")
     dub_parser.add_argument("--whisper-model", default="base", help="Whisper model size")
     dub_parser.add_argument("--translate-model", default="gemini-2.5-flash", help="Gemini translation model")
     dub_parser.add_argument("--num-speakers", type=int, default=None, help="Number of speakers (optional)")

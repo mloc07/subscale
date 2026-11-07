@@ -62,6 +62,7 @@ class VoiceBackend(Protocol):
         speed: float = 1.0,
         target_duration: Optional[float] = None,
         speaker_id: str = "spk_0",
+        ref_text: Optional[str] = None,
     ) -> tuple[np.ndarray, int]:
         """Synthesize Vietnamese text into audio array and sample rate."""
         ...
@@ -75,6 +76,7 @@ class MockVoiceBackend:
         speed: float = 1.0,
         target_duration: Optional[float] = None,
         speaker_id: str = "spk_0",
+        ref_text: Optional[str] = None,
     ) -> tuple[np.ndarray, int]:
         sr = 24000
         dur = target_duration if target_duration and target_duration > 0.5 else 2.0
@@ -109,6 +111,7 @@ class GTTSVoiceBackend:
         speed: float = 1.0,
         target_duration: Optional[float] = None,
         speaker_id: str = "spk_0",
+        ref_text: Optional[str] = None,
     ) -> tuple[np.ndarray, int]:
         from gtts import gTTS
         import io
@@ -191,16 +194,17 @@ class F5VoiceBackend:
         speed: float = 1.0,
         target_duration: Optional[float] = None,
         speaker_id: str = "spk_0",
+        ref_text: Optional[str] = None,
     ) -> tuple[np.ndarray, int]:
         self._load()
         from f5_tts.infer.utils_infer import infer_process
 
         ref_audio = str(ref_audio_path) if ref_audio_path and os.path.exists(str(ref_audio_path)) else ""
-        ref_text = ""
+        resolved_ref_text = ref_text or ""
 
         wav, sr, _ = infer_process(
             ref_audio=ref_audio,
-            ref_text=ref_text,
+            ref_text=resolved_ref_text,
             gen_text=text,
             model_obj=self._model,
             vocoder=self._vocoder,
@@ -210,3 +214,114 @@ class F5VoiceBackend:
             device=self.device,
         )
         return wav.astype(np.float32), sr
+
+
+def _preload_cuda_libs_if_needed() -> None:
+    if os.name != "posix":
+        return
+    import ctypes
+    import glob
+    import importlib.util
+    for pkg, patterns in (("nvidia.cublas", ["libcublasLt.so.12", "libcublas.so.12"]),
+                          ("nvidia.cudnn", ["libcudnn.so.9"])):
+        try:
+            spec = importlib.util.find_spec(pkg)
+            if spec and spec.submodule_search_locations:
+                lib_dir = os.path.join(list(spec.submodule_search_locations)[0], "lib")
+                for pat in patterns:
+                    for f in glob.glob(os.path.join(lib_dir, pat)):
+                        try:
+                            ctypes.CDLL(f, mode=ctypes.RTLD_GLOBAL)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+
+class OpenVoiceBackend:
+    """Zero-shot cross-lingual Voice Cloning using OpenVoice v2 Tone Color Converter."""
+
+    def __init__(self, device: str = "auto", base_lang: str = "vi"):
+        self.device = device
+        self.base_lang = base_lang
+        self._converter = None
+        self._base_tts = GTTSVoiceBackend(lang=base_lang)
+        self._speaker_target_se: dict[str, Any] = {}
+
+    def _load(self) -> None:
+        if self._converter is not None:
+            return
+        import torch
+        from huggingface_hub import hf_hub_download
+        from openvoice.api import ToneColorConverter
+
+        _preload_cuda_libs_if_needed()
+
+        dev = self.device
+        if dev == "auto":
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+
+        ckpt_path = hf_hub_download(repo_id="myshell-ai/OpenVoiceV2", filename="converter/checkpoint.pth")
+        config_path = hf_hub_download(repo_id="myshell-ai/OpenVoiceV2", filename="converter/config.json")
+        self._converter = ToneColorConverter(config_path, device=dev)
+        self._converter.load_ckpt(ckpt_path)
+        self.device = dev
+
+    def synthesize(
+        self,
+        text: str,
+        ref_audio_path: Optional[str | Path] = None,
+        speed: float = 1.0,
+        target_duration: Optional[float] = None,
+        speaker_id: str = "spk_0",
+        ref_text: Optional[str] = None,
+    ) -> tuple[np.ndarray, int]:
+        base_audio, sr = self._base_tts.synthesize(
+            text=text,
+            speed=speed,
+            speaker_id=speaker_id,
+        )
+        if not ref_audio_path or not os.path.exists(str(ref_audio_path)):
+            return base_audio, sr
+
+        try:
+            self._load()
+            from openvoice import se_extractor
+            import tempfile
+            import soundfile as sf
+
+            ref_str = str(ref_audio_path)
+            if speaker_id not in self._speaker_target_se:
+                target_se, _ = se_extractor.get_se(ref_str, self._converter, target_dir="/tmp/ov_se", vad=False)
+                self._speaker_target_se[speaker_id] = target_se
+            target_se = self._speaker_target_se[speaker_id]
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_base:
+                base_wav = f_base.name
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f_out:
+                cloned_wav = f_out.name
+
+            try:
+                _write_wav_pcm16(Path(base_wav), base_audio, sr)
+                source_se, _ = se_extractor.get_se(base_wav, self._converter, target_dir="/tmp/ov_se", vad=False)
+                self._converter.convert(
+                    audio_src_path=base_wav,
+                    src_se=source_se,
+                    tgt_se=target_se,
+                    output_path=cloned_wav,
+                    message="@Antigravity",
+                )
+                cloned_audio, cloned_sr = sf.read(cloned_wav, dtype="float32")
+                if cloned_audio.ndim > 1:
+                    cloned_audio = cloned_audio.mean(axis=1)
+                return cloned_audio, cloned_sr
+            finally:
+                for p in (base_wav, cloned_wav):
+                    if os.path.exists(p):
+                        try:
+                            os.unlink(p)
+                        except Exception:
+                            pass
+        except Exception:
+            return base_audio, sr
+

@@ -62,9 +62,10 @@ def align_audio_to_target_duration(
     audio: np.ndarray,
     sr: int,
     target_duration: float,
-    max_speedup: float = 1.25,
+    min_speed: float = 1.0,
+    max_speedup: float = 1.35,
 ) -> tuple[np.ndarray, dict[str, float]]:
-    """Align audio to target duration by speedup or padding."""
+    """Align audio to target duration by dynamic tempo adjustment and balanced padding."""
     actual_dur = len(audio) / sr
     target_samples = int(target_duration * sr)
     info = {
@@ -77,18 +78,21 @@ def align_audio_to_target_duration(
     if target_samples <= 0 or len(audio) == 0:
         return audio, info
 
-    if actual_dur > target_duration + 0.1:
-        # Needs speedup
-        speed = actual_dur / target_duration
-        effective_speed = min(speed, max_speedup)
-        audio = change_audio_speed_ffmpeg(audio, sr, effective_speed)
-        info["applied_speed"] = round(effective_speed, 3)
+    # Bidirectional tempo adjustment if discrepancy is greater than 80ms
+    if (min_speed < 1.0 and actual_dur < target_duration - 0.08) or (actual_dur > target_duration + 0.08):
+        raw_speed = actual_dur / target_duration
+        effective_speed = max(min_speed, min(max_speedup, raw_speed))
+        if abs(effective_speed - 1.0) > 0.02:
+            audio = change_audio_speed_ffmpeg(audio, sr, effective_speed)
+            info["applied_speed"] = round(effective_speed, 3)
 
-    # Pad with silence if shorter than target
+    # Pad with silence if shorter than target (balanced padding: small front, rest back)
     current_samples = len(audio)
     if current_samples < target_samples:
         pad_len = target_samples - current_samples
-        padded = np.pad(audio, (0, pad_len), mode="constant")
+        pad_pre = min(int(0.08 * sr), pad_len // 4)
+        pad_post = pad_len - pad_pre
+        padded = np.pad(audio, (pad_pre, pad_post), mode="constant")
         info["padded_sec"] = round(pad_len / sr, 3)
         return padded, info
 
