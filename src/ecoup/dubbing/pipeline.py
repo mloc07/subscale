@@ -13,6 +13,8 @@ from .audio import AudioProcessingError, NoAudioError, extract_original_hq, prob
 from .config import DubbingConfig
 from .diarization import DiarizationOptions, SpeakerDiarizer, export_speaker_previews
 from .manifest import ProjectManifest
+from .translate import DubbingTranslator, TranslatedDubSegment, TranslationConfig
+from .voice_profile import VoiceProfile, build_voice_profiles
 
 
 class DubbingPipeline:
@@ -44,6 +46,9 @@ class DubbingPipeline:
 
         self.voices_dir = self.project_dir / "voices"
         self.voices_dir.mkdir(parents=True, exist_ok=True)
+
+        self.translation_dir = self.project_dir / "translation"
+        self.translation_dir.mkdir(parents=True, exist_ok=True)
 
         self.manifest = ProjectManifest.load_or_create(self.project_dir, str(self.video_path))
 
@@ -154,7 +159,7 @@ class DubbingPipeline:
         return segments
 
     def run_s3_diarization(self) -> list[DubbingSegment]:
-        """S3: Speaker diarization & clustering, outputs diarized.json and speaker previews."""
+        """S3: Speaker diarization & clustering, outputs diarized.json."""
         self._progress("S3", 0.0)
         s3_hash = self.config.get_step_hash("S3")
         diarized_json = self.transcript_dir / "diarized.json"
@@ -184,16 +189,12 @@ class DubbingPipeline:
         )
         elapsed = time.time() - t0
 
-        # Save diarized.json
         with open(diarized_json, "w", encoding="utf-8") as f:
             json.dump([asdict(s) for s in diarized_segs], f, ensure_ascii=False, indent=2)
 
-        # Export speaker preview audio
         previews = export_speaker_previews(dialogue_wav, diarized_segs, self.voices_dir)
 
-        outputs = {
-            "diarized": str(diarized_json.relative_to(self.project_dir)),
-        }
+        outputs = {"diarized": str(diarized_json.relative_to(self.project_dir))}
         for spk, p in previews.items():
             outputs[f"preview_{spk}"] = str(p.relative_to(self.project_dir))
 
@@ -210,3 +211,98 @@ class DubbingPipeline:
         )
         self._progress("S3", 1.0)
         return diarized_segs
+
+    def run_s4_voice_profiles(self) -> dict[str, VoiceProfile]:
+        """S4: Voice profiling & reference audio extraction for each speaker."""
+        self._progress("S4", 0.0)
+        s4_hash = self.config.get_step_hash("S4")
+
+        # Check if profiles already exist
+        spk_profiles = {}
+        all_exist = True
+        for spk_dir in self.voices_dir.glob("spk_*"):
+            p_json = spk_dir / "profile.json"
+            ref_wav = spk_dir / "ref_clean.wav"
+            if p_json.exists() and ref_wav.exists():
+                with open(p_json, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                spk_profiles[spk_dir.name] = VoiceProfile(**data)
+            else:
+                all_exist = False
+
+        if all_exist and spk_profiles and self.manifest.is_step_valid("S4", s4_hash):
+            self._progress("S4", 1.0)
+            return spk_profiles
+
+        diarized_segs = self.run_s3_diarization()
+        dialogue_wav = self.audio_dir / "dialogue.wav"
+
+        t0 = time.time()
+        profiles = build_voice_profiles(dialogue_wav, diarized_segs, self.voices_dir, target_sr=24000)
+        elapsed = time.time() - t0
+
+        outputs = {}
+        for spk, vp in profiles.items():
+            outputs[f"ref_{spk}"] = vp.reference_wav
+
+        self.manifest.record_step(
+            step_name="S4",
+            config_hash=s4_hash,
+            outputs=outputs,
+            metadata={
+                "elapsed_s": round(elapsed, 2),
+                "profiles_summary": {k: {"quality": v.quality_score, "is_good": v.is_good_reference} for k, v in profiles.items()},
+            },
+        )
+        self._progress("S4", 1.0)
+        return profiles
+
+    def run_s5_translation(self, context_notes: str = "") -> list[TranslatedDubSegment]:
+        """S5: Translate dialogue to Vietnamese with duration budget constraint."""
+        self._progress("S5", 0.0)
+        s5_hash = self.config.get_step_hash("S5")
+        translated_json = self.translation_dir / "translated.json"
+
+        if self.manifest.is_step_valid("S5", s5_hash, [translated_json]):
+            self._progress("S5", 1.0)
+            with open(translated_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [TranslatedDubSegment(**item) for item in data]
+
+        diarized_segs = self.run_s3_diarization()
+
+        t0 = time.time()
+        trans_cfg = TranslationConfig(
+            model=self.config.translation.model,
+            syllables_per_second=self.config.translation.syllables_per_second,
+            max_rewrite_attempts=self.config.translation.max_rewrite_attempts,
+            temperature=self.config.translation.temperature,
+            mock=self.config.translation.mock,
+        )
+        translator = DubbingTranslator(trans_cfg)
+        translated_segs = translator.translate_segments(
+            diarized_segs,
+            context_notes=context_notes,
+            should_cancel=lambda: self._cancelled,
+        )
+        elapsed = time.time() - t0
+
+        with open(translated_json, "w", encoding="utf-8") as f:
+            json.dump([asdict(s) for s in translated_segs], f, ensure_ascii=False, indent=2)
+
+        overflow_count = sum(1 for s in translated_segs if s.overflow_flag)
+        rewritten_count = sum(1 for s in translated_segs if s.rewritten_times > 0)
+
+        self.manifest.record_step(
+            step_name="S5",
+            config_hash=s5_hash,
+            outputs={"translated": str(translated_json.relative_to(self.project_dir))},
+            metadata={
+                "elapsed_s": round(elapsed, 2),
+                "total_translated": len(translated_segs),
+                "overflow_count": overflow_count,
+                "rewritten_count": rewritten_count,
+            },
+        )
+        self._progress("S5", 1.0)
+        return translated_segs

@@ -65,18 +65,35 @@ class DiarizationDubbingConfig:
 
 
 @dataclass
+class TranslationDubbingConfig:
+    model: str = "gemini-2.5-flash"
+    syllables_per_second: float = 3.8
+    max_rewrite_attempts: int = 2
+    temperature: float = 0.3
+    mock: bool = False
+
+    def validate(self) -> None:
+        if not self.model:
+            raise ValueError("model cannot be empty.")
+        if self.syllables_per_second <= 0:
+            raise ValueError("syllables_per_second must be > 0.")
+
+
+@dataclass
 class DubbingConfig:
     project_dir: Optional[str] = None
     audio: AudioExtractConfig = field(default_factory=AudioExtractConfig)
     demucs: DemucsConfig = field(default_factory=DemucsConfig)
     asr: AsrDubbingConfig = field(default_factory=AsrDubbingConfig)
     diarization: DiarizationDubbingConfig = field(default_factory=DiarizationDubbingConfig)
+    translation: TranslationDubbingConfig = field(default_factory=TranslationDubbingConfig)
 
     def validate(self) -> None:
         self.audio.validate()
         self.demucs.validate()
         self.asr.validate()
         self.diarization.validate()
+        self.translation.validate()
 
     def get_step_hash(self, step_name: str) -> str:
         """Compute MD5 hash for configuration of a specific pipeline step."""
@@ -89,6 +106,10 @@ class DubbingConfig:
             data = asdict(self.asr)
         elif step_name == "S3":
             data = asdict(self.diarization)
+        elif step_name == "S4":
+            data = {"diarization": asdict(self.diarization)}
+        elif step_name == "S5":
+            data = asdict(self.translation)
         else:
             data = asdict(self)
         raw = json.dumps(data, sort_keys=True)
