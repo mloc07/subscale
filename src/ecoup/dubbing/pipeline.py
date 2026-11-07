@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, Optional
 
+from .asr import AsrOptions, DubbingSegment, transcribe_dialogue
 from .audio import AudioProcessingError, NoAudioError, extract_original_hq, probe_audio_info, separate_stems
 from .config import DubbingConfig
+from .diarization import DiarizationOptions, SpeakerDiarizer, export_speaker_previews
 from .manifest import ProjectManifest
 
 
@@ -34,6 +38,12 @@ class DubbingPipeline:
         # Standard project subdirectories
         self.audio_dir = self.project_dir / "audio"
         self.audio_dir.mkdir(parents=True, exist_ok=True)
+
+        self.transcript_dir = self.project_dir / "transcript"
+        self.transcript_dir.mkdir(parents=True, exist_ok=True)
+
+        self.voices_dir = self.project_dir / "voices"
+        self.voices_dir.mkdir(parents=True, exist_ok=True)
 
         self.manifest = ProjectManifest.load_or_create(self.project_dir, str(self.video_path))
 
@@ -79,7 +89,6 @@ class DubbingPipeline:
             self._progress("S1", 1.0)
             return dialogue_wav, bgm_wav
 
-        # Ensure S0 is completed
         orig_wav = self.run_s0_intake()
 
         t0 = time.time()
@@ -97,3 +106,107 @@ class DubbingPipeline:
         )
         self._progress("S1", 1.0)
         return dialogue_out, bgm_out
+
+    def run_s2_asr(self) -> list[DubbingSegment]:
+        """S2: Speech recognition on dialogue.wav, outputs segments.json."""
+        self._progress("S2", 0.0)
+        s2_hash = self.config.get_step_hash("S2")
+        segments_json = self.transcript_dir / "segments.json"
+
+        if self.manifest.is_step_valid("S2", s2_hash, [segments_json]):
+            self._progress("S2", 1.0)
+            with open(segments_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [DubbingSegment(**item) for item in data]
+
+        dialogue_wav, _ = self.run_s1_separation()
+
+        t0 = time.time()
+        asr_opts = AsrOptions(
+            model_size=self.config.asr.model_size,
+            beam_size=self.config.asr.beam_size,
+            vad_filter=self.config.asr.vad_filter,
+            language=self.config.asr.language,
+            mock=self.config.asr.mock,
+        )
+        segments, lang, prob = transcribe_dialogue(
+            dialogue_wav,
+            options=asr_opts,
+            should_cancel=lambda: self._cancelled,
+        )
+        elapsed = time.time() - t0
+
+        with open(segments_json, "w", encoding="utf-8") as f:
+            json.dump([asdict(s) for s in segments], f, ensure_ascii=False, indent=2)
+
+        self.manifest.record_step(
+            step_name="S2",
+            config_hash=s2_hash,
+            outputs={"segments": str(segments_json.relative_to(self.project_dir))},
+            metadata={
+                "elapsed_s": round(elapsed, 2),
+                "language": lang,
+                "language_prob": round(prob, 2),
+                "segments_count": len(segments),
+            },
+        )
+        self._progress("S2", 1.0)
+        return segments
+
+    def run_s3_diarization(self) -> list[DubbingSegment]:
+        """S3: Speaker diarization & clustering, outputs diarized.json and speaker previews."""
+        self._progress("S3", 0.0)
+        s3_hash = self.config.get_step_hash("S3")
+        diarized_json = self.transcript_dir / "diarized.json"
+
+        if self.manifest.is_step_valid("S3", s3_hash, [diarized_json]):
+            self._progress("S3", 1.0)
+            with open(diarized_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [DubbingSegment(**item) for item in data]
+
+        segments = self.run_s2_asr()
+        dialogue_wav = self.audio_dir / "dialogue.wav"
+
+        t0 = time.time()
+        diar_opts = DiarizationOptions(
+            num_speakers=self.config.diarization.num_speakers,
+            min_speakers=self.config.diarization.min_speakers,
+            max_speakers=self.config.diarization.max_speakers,
+            distance_threshold=self.config.diarization.distance_threshold,
+            mock=self.config.diarization.mock,
+        )
+        diarizer = SpeakerDiarizer(diar_opts)
+        diarized_segs = diarizer.diarize_segments(
+            dialogue_wav,
+            segments,
+            should_cancel=lambda: self._cancelled,
+        )
+        elapsed = time.time() - t0
+
+        # Save diarized.json
+        with open(diarized_json, "w", encoding="utf-8") as f:
+            json.dump([asdict(s) for s in diarized_segs], f, ensure_ascii=False, indent=2)
+
+        # Export speaker preview audio
+        previews = export_speaker_previews(dialogue_wav, diarized_segs, self.voices_dir)
+
+        outputs = {
+            "diarized": str(diarized_json.relative_to(self.project_dir)),
+        }
+        for spk, p in previews.items():
+            outputs[f"preview_{spk}"] = str(p.relative_to(self.project_dir))
+
+        unique_speakers = sorted(list(set(s.speaker_id for s in diarized_segs if s.speaker_id)))
+        self.manifest.record_step(
+            step_name="S3",
+            config_hash=s3_hash,
+            outputs=outputs,
+            metadata={
+                "elapsed_s": round(elapsed, 2),
+                "unique_speakers": unique_speakers,
+                "overlaps_count": sum(1 for s in diarized_segs if s.is_overlap),
+            },
+        )
+        self._progress("S3", 1.0)
+        return diarized_segs
