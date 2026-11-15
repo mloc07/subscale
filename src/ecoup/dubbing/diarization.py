@@ -91,6 +91,12 @@ class SpeakerDiarizer:
     def _get_classifier(self):
         if self._classifier is None and not self.options.mock:
             import torch
+            try:
+                import torchaudio
+                if not hasattr(torchaudio, "list_audio_backends"):
+                    torchaudio.list_audio_backends = lambda: ["soundfile"]
+            except Exception:
+                pass
             from speechbrain.inference.speaker import EncoderClassifier
 
             device = "cuda" if torch.cuda.is_available() else "cpu"

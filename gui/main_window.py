@@ -23,11 +23,17 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QSpinBox,
+    QDoubleSpinBox,
     QProgressBar,
     QTextEdit,
     QFileDialog,
     QMessageBox,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QScrollArea,
+    QAbstractItemView,
 )
 
 from ecoup.cli import check_gpu, _ensure_path_refreshed
@@ -307,6 +313,159 @@ class DubbingWorker(QThread):
             self.pipeline.cancel()
 
 
+class CloneVoicesWorker(QThread):
+    """Background worker to clone all speaker voices from a source video/audio."""
+    progress_sig = pyqtSignal(str, float)
+    log_sig = pyqtSignal(str)
+    finished_sig = pyqtSignal(bool, list, str)
+
+    def __init__(
+        self,
+        source_path: str,
+        label_prefix: str = "",
+        num_speakers: Optional[int] = None,
+        distance_threshold: float = 0.72,
+        whisper_model: str = "medium",
+        pitch_match_mode: str = "auto",
+    ):
+        super().__init__()
+        self.source_path = source_path
+        self.label_prefix = label_prefix
+        self.num_speakers = num_speakers
+        self.distance_threshold = distance_threshold
+        self.whisper_model = whisper_model
+        self.pitch_match_mode = pitch_match_mode
+
+    def run(self):
+        try:
+            from ecoup.dubbing.voice_bank import clone_voices_from_video
+
+            def _on_prog(step: str, frac: float):
+                self.progress_sig.emit(step, frac)
+                self.log_sig.emit(f"[Clone Giọng - {step}] {int(frac * 100)}%")
+
+            entries = clone_voices_from_video(
+                video_path=self.source_path,
+                label_prefix=self.label_prefix,
+                num_speakers=self.num_speakers,
+                distance_threshold=self.distance_threshold,
+                whisper_model=self.whisper_model,
+                pitch_match_mode=self.pitch_match_mode,
+                on_progress=_on_prog,
+            )
+            self.finished_sig.emit(True, entries, f"Đã clone thành công {len(entries)} giọng nói.")
+        except Exception as e:
+            self.finished_sig.emit(False, [], str(e))
+
+
+class AnalyzeTargetSpeakersWorker(QThread):
+    """Background worker to detect characters/speakers in a target video."""
+    progress_sig = pyqtSignal(str, float)
+    log_sig = pyqtSignal(str)
+    finished_sig = pyqtSignal(bool, list, str)
+
+    def __init__(self, target_video: str, num_speakers: Optional[int], whisper_model: str):
+        super().__init__()
+        self.target_video = target_video
+        self.num_speakers = num_speakers
+        self.whisper_model = whisper_model
+
+    def run(self):
+        try:
+            from ecoup.dubbing.config import DubbingConfig
+            from ecoup.dubbing.pipeline import DubbingPipeline
+
+            p = Path(self.target_video)
+            cfg = DubbingConfig(project_dir=str(p.parent / f"dub_project_{p.stem}"))
+            cfg.asr.model_size = self.whisper_model
+            cfg.diarization.num_speakers = self.num_speakers
+
+            def _on_prog(step: str, frac: float):
+                self.progress_sig.emit(step, frac)
+                self.log_sig.emit(f"[Phân tích Video đích - {step}] {int(frac * 100)}%")
+
+            pipe = DubbingPipeline(self.target_video, config=cfg, on_progress=_on_prog)
+            speakers = pipe.analyze_target_speakers()
+            self.finished_sig.emit(True, speakers, f"Phát hiện {len(speakers)} nhân vật trong video đích.")
+        except Exception as e:
+            self.finished_sig.emit(False, [], str(e))
+
+
+class TtsCloneMp3Worker(QThread):
+    """Background worker to synthesize text using a cloned voice and export .mp3."""
+    progress_sig = pyqtSignal(float)
+    log_sig = pyqtSignal(str)
+    finished_sig = pyqtSignal(bool, dict, str)
+
+    def __init__(
+        self,
+        clone_spec: str,
+        text: str,
+        output_mp3: str,
+        base_lang: str = "vi",
+        speed: float = 1.0,
+        pitch_match_mode: str = "auto",
+        pitch_shift_semitones: float = 0.0,
+    ):
+        super().__init__()
+        self.clone_spec = clone_spec
+        self.text = text
+        self.output_mp3 = output_mp3
+        self.base_lang = base_lang
+        self.speed = speed
+        self.pitch_match_mode = pitch_match_mode
+        self.pitch_shift_semitones = pitch_shift_semitones
+
+    def run(self):
+        backend = None
+        try:
+            from ecoup.dubbing.tts import OpenVoiceBackend, synthesize_text_to_mp3
+            from ecoup.dubbing.voice_bank import VoiceBankManager
+
+            bank = VoiceBankManager()
+            ref_path = bank.resolve_voice(self.clone_spec)
+            if ref_path is None or not ref_path.exists():
+                self.finished_sig.emit(False, {}, f"Không tìm thấy mẫu giọng '{self.clone_spec}'.")
+                return
+
+            clone_id = VoiceBankManager._normalize_choice_id(self.clone_spec)
+            backend = OpenVoiceBackend(
+                device="auto",
+                base_lang=self.base_lang,
+                pitch_match_mode=self.pitch_match_mode,
+                pitch_shift_semitones=self.pitch_shift_semitones,
+            )
+
+            def _on_prog(frac: float):
+                self.progress_sig.emit(frac)
+                self.log_sig.emit(f"[TTS Xuất MP3] {int(frac * 100)}%")
+
+            rep = synthesize_text_to_mp3(
+                text=self.text,
+                output_mp3=self.output_mp3,
+                backend=backend,
+                ref_audio_path=ref_path,
+                speed=self.speed,
+                speaker_id=clone_id,
+                bitrate="192k",
+                on_progress=_on_prog,
+            )
+            self.finished_sig.emit(True, rep, "Đã tạo file .mp3 thành công!")
+        except Exception as e:
+            self.finished_sig.emit(False, {}, str(e))
+        finally:
+            if backend is not None and getattr(backend, "_converter", None) is not None:
+                try:
+                    backend._converter = None
+                    import gc
+                    import torch
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+
 class MainWindow(QMainWindow):
     """Main window for Eco Video Upscaler & Subtitle Studio."""
 
@@ -319,6 +478,12 @@ class MainWindow(QMainWindow):
         self.worker: Optional[PipelineWorker] = None
         self.sub_worker: Optional[SubtitleWorker] = None
         self.dub_worker: Optional[DubbingWorker] = None
+        self.vc_clone_worker: Optional[CloneVoicesWorker] = None
+        self.vc_analyze_worker: Optional[AnalyzeTargetSpeakersWorker] = None
+        self.vc_dub_worker: Optional[DubbingWorker] = None
+        self.vc_tts_worker: Optional[TtsCloneMp3Worker] = None
+        self.vc_target_speakers: list[dict] = []
+        self.vc_target_combos: dict[str, QComboBox] = {}
         self.is_paused = False
         self.meta: Optional[VideoMetadata] = None
         self.sub_meta: Optional[VideoMetadata] = None
@@ -350,9 +515,11 @@ class MainWindow(QMainWindow):
         upscale_tab = self._build_upscale_tab()
         subtitle_tab = self._build_subtitle_tab()
         dubbing_tab = self._build_dubbing_tab()
+        voice_clone_tab = self._build_voice_clone_tab()
         self.tabs.addTab(upscale_tab, "⚡ Nâng cấp Video (Upscale)")
         self.tabs.addTab(subtitle_tab, "📝 Phụ đề tự động (Subtitle)")
         self.tabs.addTab(dubbing_tab, "🎙️ Lồng tiếng AI (Dubbing)")
+        self.tabs.addTab(voice_clone_tab, "🧬 Voice Cloning Studio")
         root_layout.addWidget(self.tabs)
 
         # 3. Real-time Console Log Box
@@ -800,6 +967,7 @@ class MainWindow(QMainWindow):
         t_col.addWidget(QLabel("Bộ tổng hợp giọng nói (TTS):"))
         self.dub_backend_combo = QComboBox()
         self.dub_backend_combo.addItems([
+            "OpenVoice v2 (Clone âm sắc giọng gốc + F0)",
             "Google TTS (gTTS - Ổn định, tự nhiên, đa âm điệu)",
             "F5-TTS Vietnamese (Clone giọng mẫu - Yêu cầu GPU)",
             "Mock (Chạy thử nghiệm nhanh)",
@@ -916,6 +1084,285 @@ class MainWindow(QMainWindow):
         layout.addWidget(prog_box)
 
         layout.addStretch()
+        return tab
+
+    def _build_voice_clone_tab(self) -> QWidget:
+        tab = QWidget()
+        root = QVBoxLayout(tab)
+        root.setSpacing(8)
+        root.setContentsMargins(8, 10, 8, 8)
+
+        sub_tabs = QTabWidget()
+
+        # ---------- Sub-tab 4.1: Clone voices from Video / Audio ----------
+        st1 = QWidget()
+        st1_lay = QVBoxLayout(st1)
+        st1_lay.setSpacing(8)
+
+        src_box = QWidget()
+        src_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        src_grid = QGridLayout(src_box)
+        src_grid.setSpacing(8)
+
+        src_grid.addWidget(QLabel("Video/Audio nguồn:"), 0, 0)
+        self.vc_src_edit = QLineEdit()
+        self.vc_src_edit.setPlaceholderText("Chọn video hoặc file âm thanh chứa 1 hoặc nhiều nhân vật...")
+        src_grid.addWidget(self.vc_src_edit, 0, 1, 1, 2)
+        vc_src_btn = QPushButton("Chọn...")
+        vc_src_btn.clicked.connect(self._vc_browse_source)
+        src_grid.addWidget(vc_src_btn, 0, 3)
+
+        src_grid.addWidget(QLabel("Tên bộ giọng (Label):"), 1, 0)
+        self.vc_label_edit = QLineEdit()
+        self.vc_label_edit.setPlaceholderText("Ví dụ: FamilyGuy_S1, NhanVatA...")
+        src_grid.addWidget(self.vc_label_edit, 1, 1)
+
+        src_grid.addWidget(QLabel("Số nhân vật:"), 1, 2)
+        self.vc_num_spk_combo = QComboBox()
+        self.vc_num_spk_combo.addItems(["Tự động (Auto)", "1", "2", "3", "4", "5", "6", "7", "8"])
+        src_grid.addWidget(self.vc_num_spk_combo, 1, 3)
+
+        src_grid.addWidget(QLabel("Whisper ASR:"), 2, 0)
+        self.vc_whisper_combo = QComboBox()
+        self.vc_whisper_combo.addItems(["medium", "base", "small", "large-v3"])
+        src_grid.addWidget(self.vc_whisper_combo, 2, 1)
+
+        src_grid.addWidget(QLabel("Ngưỡng tách:"), 2, 2)
+        self.vc_thresh_spin = QDoubleSpinBox()
+        self.vc_thresh_spin.setRange(0.45, 0.95)
+        self.vc_thresh_spin.setSingleStep(0.02)
+        self.vc_thresh_spin.setValue(0.72)
+        src_grid.addWidget(self.vc_thresh_spin, 2, 3)
+
+        src_grid.addWidget(QLabel("Cao độ nghe thử:"), 3, 0)
+        self.vc_pitch_combo = QComboBox()
+        self.vc_pitch_combo.addItems(["Tự động khớp cao độ F0", "Giữ nguyên gốc"])
+        src_grid.addWidget(self.vc_pitch_combo, 3, 1, 1, 3)
+
+        st1_lay.addWidget(src_box)
+
+        ctrl_row = QHBoxLayout()
+        self.vc_clone_btn = QPushButton("🧬 Phân tích & Xuất các bản Clone")
+        self.vc_clone_btn.setObjectName("primaryBtn")
+        self.vc_clone_btn.clicked.connect(self._vc_start_clone)
+        ctrl_row.addWidget(self.vc_clone_btn)
+
+        refresh_bank_btn = QPushButton("🔄 Tải lại Kho")
+        refresh_bank_btn.clicked.connect(self._vc_refresh_bank_ui)
+        ctrl_row.addWidget(refresh_bank_btn)
+
+        play_sel_btn = QPushButton("▶ Nghe bản Clone (.mp3)")
+        play_sel_btn.clicked.connect(self._vc_play_selected_clone)
+        ctrl_row.addWidget(play_sel_btn)
+
+        rename_sel_btn = QPushButton("✏️ Đổi tên")
+        rename_sel_btn.clicked.connect(self._vc_rename_selected_clone)
+        ctrl_row.addWidget(rename_sel_btn)
+
+        del_sel_btn = QPushButton("🗑️ Xóa")
+        del_sel_btn.setObjectName("dangerBtn")
+        del_sel_btn.clicked.connect(self._vc_delete_selected_clone)
+        ctrl_row.addWidget(del_sel_btn)
+        st1_lay.addLayout(ctrl_row)
+
+        self.vc_clone_prog = QProgressBar()
+        self.vc_clone_prog.setValue(0)
+        st1_lay.addWidget(self.vc_clone_prog)
+
+        self.vc_bank_table = QTableWidget(0, 6)
+        self.vc_bank_table.setHorizontalHeaderLabels(["Clone ID", "Tên hiển thị", "Vai gốc", "Thời lượng", "F0 (Hz)", "Thoại mẫu"])
+        self.vc_bank_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.vc_bank_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.vc_bank_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        st1_lay.addWidget(self.vc_bank_table)
+
+        sub_tabs.addTab(st1, "1. Clone giọng từ Video / Audio")
+
+        # ---------- Sub-tab 4.2: Cross-video Speaker Analysis & Dubbing ----------
+        st2 = QWidget()
+        st2_lay = QVBoxLayout(st2)
+        st2_lay.setSpacing(8)
+
+        tgt_box = QWidget()
+        tgt_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        tgt_grid = QGridLayout(tgt_box)
+        tgt_grid.setSpacing(6)
+
+        tgt_grid.addWidget(QLabel("Video đích cần lồng tiếng:"), 0, 0)
+        self.vc_tgt_edit = QLineEdit()
+        self.vc_tgt_edit.setPlaceholderText("Chọn Video thứ 2 cần phân tích nhân vật và lồng tiếng...")
+        tgt_grid.addWidget(self.vc_tgt_edit, 0, 1, 1, 2)
+        vc_tgt_btn = QPushButton("Chọn...")
+        vc_tgt_btn.clicked.connect(self._vc_browse_target)
+        tgt_grid.addWidget(vc_tgt_btn, 0, 3)
+
+        tgt_grid.addWidget(QLabel("Số nhân vật đích:"), 1, 0)
+        self.vc_tgt_num_combo = QComboBox()
+        self.vc_tgt_num_combo.addItems(["Tự động (Auto)", "1", "2", "3", "4", "5", "6", "7", "8"])
+        tgt_grid.addWidget(self.vc_tgt_num_combo, 1, 1)
+
+        tgt_grid.addWidget(QLabel("Whisper ASR:"), 1, 2)
+        self.vc_tgt_whisper_combo = QComboBox()
+        self.vc_tgt_whisper_combo.addItems(["medium", "base", "small", "large-v3"])
+        tgt_grid.addWidget(self.vc_tgt_whisper_combo, 1, 3)
+
+        st2_lay.addWidget(tgt_box)
+
+        ana_row = QHBoxLayout()
+        self.vc_analyze_btn = QPushButton("🔍 Phân tích nhân vật trong Video đích")
+        self.vc_analyze_btn.clicked.connect(self._vc_start_analyze_target)
+        ana_row.addWidget(self.vc_analyze_btn)
+
+        vc_f0_map_btn = QPushButton("🎯 Gợi ý theo F0")
+        vc_f0_map_btn.clicked.connect(self._vc_apply_f0_mapping)
+        ana_row.addWidget(vc_f0_map_btn)
+
+        vc_ref_map_btn = QPushButton("🔄 Làm mới DS Clone")
+        vc_ref_map_btn.clicked.connect(self._vc_rebuild_target_mapping_rows)
+        ana_row.addWidget(vc_ref_map_btn)
+        ana_row.addStretch()
+        st2_lay.addLayout(ana_row)
+
+        map_scroll = QScrollArea()
+        map_scroll.setWidgetResizable(True)
+        map_scroll.setMinimumHeight(150)
+        self.vc_map_container = QWidget()
+        self.vc_map_layout = QVBoxLayout(self.vc_map_container)
+        self.vc_map_layout.setSpacing(6)
+        self.vc_map_layout.addWidget(QLabel("Hãy bấm 'Phân tích nhân vật' để hiển thị danh sách nhân vật và ghép Clone."))
+        self.vc_map_layout.addStretch()
+        map_scroll.setWidget(self.vc_map_container)
+        st2_lay.addWidget(map_scroll)
+
+        cfg2_box = QWidget()
+        cfg2_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        cfg2_grid = QGridLayout(cfg2_box)
+        cfg2_grid.setSpacing(6)
+
+        cfg2_grid.addWidget(QLabel("Gemini Model:"), 0, 0)
+        self.vc_tgt_gemini_combo = QComboBox()
+        self.vc_tgt_gemini_combo.addItems(["gemini-2.5-flash", "gemini-1.5-flash"])
+        cfg2_grid.addWidget(self.vc_tgt_gemini_combo, 0, 1)
+
+        cfg2_grid.addWidget(QLabel("Khớp cao độ:"), 0, 2)
+        self.vc_tgt_pitch_combo = QComboBox()
+        self.vc_tgt_pitch_combo.addItems(["Tự động khớp F0", "Giữ nguyên gốc", "Thủ công (semitones)"])
+        cfg2_grid.addWidget(self.vc_tgt_pitch_combo, 0, 3)
+
+        cfg2_grid.addWidget(QLabel("Dịch semitones:"), 1, 0)
+        self.vc_tgt_pitch_spin = QDoubleSpinBox()
+        self.vc_tgt_pitch_spin.setRange(-7.0, 7.0)
+        self.vc_tgt_pitch_spin.setSingleStep(0.5)
+        cfg2_grid.addWidget(self.vc_tgt_pitch_spin, 1, 1)
+
+        cfg2_grid.addWidget(QLabel("Ngữ cảnh dịch:"), 1, 2)
+        self.vc_tgt_context_edit = QLineEdit()
+        self.vc_tgt_context_edit.setPlaceholderText("Ngữ cảnh phim, cách xưng hô...")
+        cfg2_grid.addWidget(self.vc_tgt_context_edit, 1, 3)
+
+        cfg2_grid.addWidget(QLabel("Gemini API Key:"), 2, 0)
+        self.vc_tgt_api_key_edit = QLineEdit()
+        self.vc_tgt_api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.vc_tgt_api_key_edit.setPlaceholderText("Để trống nếu đã thiết lập GEMINI_API_KEY...")
+        cfg2_grid.addWidget(self.vc_tgt_api_key_edit, 2, 1, 1, 3)
+
+        st2_lay.addWidget(cfg2_box)
+
+        self.vc_dub_prog = QProgressBar()
+        self.vc_dub_prog.setValue(0)
+        st2_lay.addWidget(self.vc_dub_prog)
+
+        dub2_row = QHBoxLayout()
+        self.vc_dub_start_btn = QPushButton("🎬 Bắt đầu Lồng tiếng theo Giọng đã gán")
+        self.vc_dub_start_btn.setObjectName("primaryBtn")
+        self.vc_dub_start_btn.clicked.connect(self._vc_start_dub_mapped)
+        dub2_row.addWidget(self.vc_dub_start_btn)
+
+        self.vc_dub_cancel_btn = QPushButton("Hủy")
+        self.vc_dub_cancel_btn.setObjectName("dangerBtn")
+        self.vc_dub_cancel_btn.setEnabled(False)
+        self.vc_dub_cancel_btn.clicked.connect(self._vc_cancel_dub_mapped)
+        dub2_row.addWidget(self.vc_dub_cancel_btn)
+        dub2_row.addStretch()
+        st2_lay.addLayout(dub2_row)
+
+        sub_tabs.addTab(st2, "2. Lồng tiếng Video bằng Giọng Clone")
+
+        # ---------- Sub-tab 4.3: Select Clone -> Read TTS -> Export .MP3 ----------
+        st3 = QWidget()
+        st3_lay = QVBoxLayout(st3)
+        st3_lay.setSpacing(8)
+
+        tts_box = QWidget()
+        tts_box.setStyleSheet("background-color: #202023; border: 1px solid #2e2e33; border-radius: 6px; padding: 6px;")
+        tts_grid = QGridLayout(tts_box)
+        tts_grid.setSpacing(8)
+
+        tts_grid.addWidget(QLabel("Chọn Giọng Clone:"), 0, 0)
+        self.vc_tts_clone_combo = QComboBox()
+        tts_grid.addWidget(self.vc_tts_clone_combo, 0, 1, 1, 2)
+        vc_tts_play_ref_btn = QPushButton("▶ Nghe mẫu")
+        vc_tts_play_ref_btn.clicked.connect(self._vc_play_tts_ref)
+        tts_grid.addWidget(vc_tts_play_ref_btn, 0, 3)
+
+        tts_grid.addWidget(QLabel("Ngôn ngữ:"), 1, 0)
+        self.vc_tts_lang_combo = QComboBox()
+        self.vc_tts_lang_combo.addItems(["Tiếng Việt (vi)", "English (en)"])
+        tts_grid.addWidget(self.vc_tts_lang_combo, 1, 1)
+
+        tts_grid.addWidget(QLabel("Tốc độ đọc:"), 1, 2)
+        self.vc_tts_speed_spin = QDoubleSpinBox()
+        self.vc_tts_speed_spin.setRange(0.65, 1.55)
+        self.vc_tts_speed_spin.setSingleStep(0.05)
+        self.vc_tts_speed_spin.setValue(1.0)
+        tts_grid.addWidget(self.vc_tts_speed_spin, 1, 3)
+
+        tts_grid.addWidget(QLabel("Cao độ:"), 2, 0)
+        self.vc_tts_pitch_combo = QComboBox()
+        self.vc_tts_pitch_combo.addItems(["Tự động khớp F0", "Giữ nguyên gốc", "Thủ công (semitones)"])
+        tts_grid.addWidget(self.vc_tts_pitch_combo, 2, 1)
+
+        tts_grid.addWidget(QLabel("Dịch semitones:"), 2, 2)
+        self.vc_tts_pitch_spin = QDoubleSpinBox()
+        self.vc_tts_pitch_spin.setRange(-7.0, 7.0)
+        self.vc_tts_pitch_spin.setSingleStep(0.5)
+        tts_grid.addWidget(self.vc_tts_pitch_spin, 2, 3)
+
+        tts_grid.addWidget(QLabel("Xuất file .MP3:"), 3, 0)
+        self.vc_tts_out_edit = QLineEdit(str(Path("outputs/tts_clone_output.mp3")))
+        tts_grid.addWidget(self.vc_tts_out_edit, 3, 1, 1, 2)
+        vc_tts_save_btn = QPushButton("Chọn nơi lưu...")
+        vc_tts_save_btn.clicked.connect(self._vc_browse_tts_out)
+        tts_grid.addWidget(vc_tts_save_btn, 3, 3)
+
+        st3_lay.addWidget(tts_box)
+
+        st3_lay.addWidget(QLabel("Nội dung văn bản cần đọc:"))
+        self.vc_tts_text_edit = QTextEdit()
+        self.vc_tts_text_edit.setPlaceholderText("Nhập đoạn văn bản nhiều câu cần tổng hợp sang giọng clone và xuất .mp3...")
+        self.vc_tts_text_edit.setMinimumHeight(110)
+        st3_lay.addWidget(self.vc_tts_text_edit)
+
+        self.vc_tts_prog = QProgressBar()
+        self.vc_tts_prog.setValue(0)
+        st3_lay.addWidget(self.vc_tts_prog)
+
+        tts_btn_row = QHBoxLayout()
+        self.vc_tts_start_btn = QPushButton("🔊 Đọc & Xuất file .MP3")
+        self.vc_tts_start_btn.setObjectName("primaryBtn")
+        self.vc_tts_start_btn.clicked.connect(self._vc_start_tts_mp3)
+        tts_btn_row.addWidget(self.vc_tts_start_btn)
+
+        self.vc_tts_play_out_btn = QPushButton("▶ Nghe file .MP3 vừa xuất")
+        self.vc_tts_play_out_btn.clicked.connect(lambda: self._open_local_media(self.vc_tts_out_edit.text().strip()))
+        tts_btn_row.addWidget(self.vc_tts_play_out_btn)
+        tts_btn_row.addStretch()
+        st3_lay.addLayout(tts_btn_row)
+
+        sub_tabs.addTab(st3, "3. Đọc TTS & Xuất .MP3")
+
+        root.addWidget(sub_tabs)
+        self._vc_refresh_bank_ui()
         return tab
 
     def _init_hardware_info(self):
@@ -1267,7 +1714,9 @@ class MainWindow(QMainWindow):
         cfg = DubbingConfig(project_dir=proj_dir)
 
         backend_text = self.dub_backend_combo.currentText().lower()
-        if "google" in backend_text or "gtts" in backend_text:
+        if "openvoice" in backend_text or "clone âm sắc" in backend_text:
+            cfg.tts.backend = "openvoice"
+        elif "google" in backend_text or "gtts" in backend_text:
             cfg.tts.backend = "gtts"
         elif "f5" in backend_text:
             cfg.tts.backend = "f5"
@@ -1357,6 +1806,376 @@ class MainWindow(QMainWindow):
         folder = Path(proj_dir) if proj_dir else Path.cwd()
         if folder.exists():
             os.startfile(folder)
+
+    # ================= TAB 4: VOICE CLONING STUDIO HANDLERS =================
+    def _open_local_media(self, path_str: str):
+        p = Path(path_str) if path_str else None
+        if not p or not p.exists():
+            QMessageBox.warning(self, "Thông báo", "Chưa có tệp âm thanh để phát.")
+            return
+        if sys.platform.startswith("win"):
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            import subprocess
+            subprocess.Popen(["open", str(p)])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", str(p)])
+
+    @staticmethod
+    def _vc_pitch_mode_from_text(text: str) -> str:
+        low = (text or "").lower()
+        if "giữ nguyên" in low or "none" in low:
+            return "none"
+        if "thủ công" in low or "manual" in low:
+            return "manual"
+        return "auto"
+
+    def _vc_browse_source(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Chọn Video/Audio nguồn", "", "Media Files (*.mp4 *.mkv *.avi *.mov *.webm *.wav *.mp3 *.m4a)"
+        )
+        if file:
+            self.vc_src_edit.setText(file)
+
+    def _vc_browse_target(self):
+        file, _ = QFileDialog.getOpenFileName(
+            self, "Chọn Video đích cần lồng tiếng", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.webm)"
+        )
+        if file:
+            self.vc_tgt_edit.setText(file)
+
+    def _vc_browse_tts_out(self):
+        file, _ = QFileDialog.getSaveFileName(
+            self, "Lưu File Âm Thanh MP3", self.vc_tts_out_edit.text() or "outputs/tts_clone.mp3", "MP3 Audio (*.mp3)"
+        )
+        if file:
+            self.vc_tts_out_edit.setText(file)
+
+    def _vc_refresh_bank_ui(self):
+        try:
+            from ecoup.dubbing.voice_bank import VoiceBankManager
+            bank = VoiceBankManager()
+            voices = bank.list_voices()
+        except Exception as e:
+            self.log_box.append(f"[Voice Bank lỗi] {e}")
+            return
+
+        self.vc_bank_table.setRowCount(len(voices))
+        for r, e in enumerate(voices):
+            self.vc_bank_table.setItem(r, 0, QTableWidgetItem(e.clone_id))
+            self.vc_bank_table.setItem(r, 1, QTableWidgetItem(e.display_name))
+            self.vc_bank_table.setItem(r, 2, QTableWidgetItem(e.speaker_id))
+            self.vc_bank_table.setItem(r, 3, QTableWidgetItem(f"{e.speaking_duration_s:.1f}s"))
+            f0_s = f"{e.estimated_f0_hz:.0f} Hz" if e.estimated_f0_hz > 0 else "N/A"
+            self.vc_bank_table.setItem(r, 4, QTableWidgetItem(f0_s))
+            self.vc_bank_table.setItem(r, 5, QTableWidgetItem((e.reference_text or "")[:60]))
+
+        cur_tts = self.vc_tts_clone_combo.currentText()
+        self.vc_tts_clone_combo.clear()
+        choices = bank.get_dropdown_choices()
+        self.vc_tts_clone_combo.addItems(choices)
+        if cur_tts in choices:
+            self.vc_tts_clone_combo.setCurrentText(cur_tts)
+
+        if self.vc_target_speakers:
+            self._vc_rebuild_target_mapping_rows()
+
+    def _vc_selected_clone_id(self) -> str:
+        row = self.vc_bank_table.currentRow()
+        if row < 0 and self.vc_bank_table.rowCount() > 0:
+            row = 0
+        if row < 0:
+            return ""
+        item = self.vc_bank_table.item(row, 0)
+        return item.text().strip() if item else ""
+
+    def _vc_play_selected_clone(self):
+        cid = self._vc_selected_clone_id()
+        if not cid:
+            QMessageBox.information(self, "Thông báo", "Chưa có bản Clone nào được chọn.")
+            return
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+        entry = VoiceBankManager().get_voice(cid)
+        if entry:
+            self._open_local_media(entry.preview_mp3_path or entry.ref_wav_path)
+
+    def _vc_rename_selected_clone(self):
+        cid = self._vc_selected_clone_id()
+        if not cid:
+            return
+        from PyQt6.QtWidgets import QInputDialog
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+        bank = VoiceBankManager()
+        entry = bank.get_voice(cid)
+        new_name, ok = QInputDialog.getText(
+            self, "Đổi tên Giọng Clone", "Tên hiển thị mới:", text=entry.display_name if entry else cid
+        )
+        if ok and new_name.strip():
+            bank.rename_voice(cid, new_name.strip())
+            self._vc_refresh_bank_ui()
+
+    def _vc_delete_selected_clone(self):
+        cid = self._vc_selected_clone_id()
+        if not cid:
+            return
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+        if VoiceBankManager().delete_voice(cid):
+            self.log_box.append(f"[Kho Giọng] Đã xóa bản clone '{cid}'.")
+            self._vc_refresh_bank_ui()
+
+    def _vc_start_clone(self):
+        src = self.vc_src_edit.text().strip()
+        if not src or not os.path.exists(src):
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn Video/Audio nguồn hợp lệ.")
+            return
+        num_txt = self.vc_num_spk_combo.currentText()
+        num_spk = int(num_txt) if num_txt.isdigit() else None
+
+        self.vc_clone_btn.setEnabled(False)
+        self.vc_clone_prog.setValue(0)
+        self.status_badge.setText("Đang clone giọng...")
+        self.vc_clone_worker = CloneVoicesWorker(
+            source_path=src,
+            label_prefix=self.vc_label_edit.text().strip(),
+            num_speakers=num_spk,
+            distance_threshold=float(self.vc_thresh_spin.value()),
+            whisper_model=self.vc_whisper_combo.currentText(),
+            pitch_match_mode=self._vc_pitch_mode_from_text(self.vc_pitch_combo.currentText()),
+        )
+        self.vc_clone_worker.progress_sig.connect(self._vc_on_clone_progress)
+        self.vc_clone_worker.log_sig.connect(lambda msg: self.log_box.append(msg))
+        self.vc_clone_worker.finished_sig.connect(self._vc_on_clone_finished)
+        self.vc_clone_worker.start()
+
+    def _vc_on_clone_progress(self, step: str, frac: float):
+        base = {"S0": 5, "S1": 25, "S2": 45, "S3": 62, "S4": 75, "S4B_CLONE": 90}.get(step, 50)
+        self.vc_clone_prog.setValue(min(99, int(base + frac * 10)))
+
+    def _vc_on_clone_finished(self, success: bool, entries: list, message: str):
+        self.vc_clone_btn.setEnabled(True)
+        self.status_badge.setText("Sẵn sàng")
+        self.vc_clone_prog.setValue(100 if success else 0)
+        self._vc_refresh_bank_ui()
+        if success:
+            self.log_box.append(f"[Clone Giọng] {message}")
+            QMessageBox.information(self, "Hoàn tất Clone Giọng", message)
+        else:
+            self.log_box.append(f"[Clone Giọng lỗi] {message}")
+            QMessageBox.critical(self, "Lỗi Clone Giọng", message)
+
+    def _vc_start_analyze_target(self):
+        tgt = self.vc_tgt_edit.text().strip()
+        if not tgt or not os.path.exists(tgt):
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn Video đích hợp lệ.")
+            return
+        num_txt = self.vc_tgt_num_combo.currentText()
+        num_spk = int(num_txt) if num_txt.isdigit() else None
+
+        self.vc_analyze_btn.setEnabled(False)
+        self.status_badge.setText("Đang phân tích Video đích...")
+        self.vc_analyze_worker = AnalyzeTargetSpeakersWorker(
+            target_video=tgt,
+            num_speakers=num_spk,
+            whisper_model=self.vc_tgt_whisper_combo.currentText(),
+        )
+        self.vc_analyze_worker.log_sig.connect(lambda msg: self.log_box.append(msg))
+        self.vc_analyze_worker.finished_sig.connect(self._vc_on_analyze_finished)
+        self.vc_analyze_worker.start()
+
+    def _vc_on_analyze_finished(self, success: bool, speakers: list, message: str):
+        self.vc_analyze_btn.setEnabled(True)
+        self.status_badge.setText("Sẵn sàng")
+        if success:
+            self.vc_target_speakers = speakers
+            self._vc_rebuild_target_mapping_rows()
+            self.log_box.append(f"[Phân tích Video đích] {message}")
+        else:
+            QMessageBox.critical(self, "Lỗi phân tích", message)
+
+    def _vc_rebuild_target_mapping_rows(self, custom_mapping: Optional[dict[str, str]] = None):
+        while self.vc_map_layout.count():
+            item = self.vc_map_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self.vc_target_combos = {}
+
+        if not self.vc_target_speakers:
+            self.vc_map_layout.addWidget(QLabel("Chưa có dữ liệu nhân vật đích."))
+            self.vc_map_layout.addStretch()
+            return
+
+        from ecoup.dubbing.voice_bank import VoiceBankManager, suggest_speaker_mapping
+        bank = VoiceBankManager()
+        voices = bank.list_voices()
+        special_opts = [
+            "Tự clone từ nhân vật gốc [__self__]",
+            "Giữ nguyên thoại gốc [__original__]",
+        ]
+        choices = bank.get_dropdown_choices() + special_opts
+        label_by_id = {v.clone_id: bank.format_choice_label(v) for v in voices}
+        label_by_id["__self__"] = special_opts[0]
+        label_by_id["__original__"] = special_opts[1]
+
+        mapping = custom_mapping if isinstance(custom_mapping, dict) else suggest_speaker_mapping(
+            self.vc_target_speakers, voices, mode="order"
+        )
+
+        for spk in self.vc_target_speakers:
+            spk_id = str(spk["speaker_id"])
+            row_w = QWidget()
+            row_lay = QHBoxLayout(row_w)
+            row_lay.setContentsMargins(2, 2, 2, 2)
+
+            f0_s = f"~{spk['estimated_f0_hz']:.0f}Hz" if spk.get("estimated_f0_hz", 0) > 0 else "N/A"
+            lbl = QLabel(f"{spk['label']} ({spk['speaking_duration_s']:.1f}s, {f0_s})")
+            lbl.setMinimumWidth(210)
+            row_lay.addWidget(lbl)
+
+            play_btn = QPushButton("▶ Nghe")
+            prev_wav = spk.get("preview_wav", "")
+            play_btn.clicked.connect(lambda _chk=False, p=prev_wav: self._open_local_media(p))
+            row_lay.addWidget(play_btn)
+
+            combo = QComboBox()
+            combo.addItems(choices)
+            chosen_id = mapping.get(spk_id, "__self__")
+            chosen_lbl = label_by_id.get(chosen_id)
+            if chosen_lbl and chosen_lbl in choices:
+                combo.setCurrentText(chosen_lbl)
+            row_lay.addWidget(combo, 1)
+
+            self.vc_target_combos[spk_id] = combo
+            self.vc_map_layout.addWidget(row_w)
+
+        self.vc_map_layout.addStretch()
+
+    def _vc_apply_f0_mapping(self):
+        if not self.vc_target_speakers:
+            return
+        from ecoup.dubbing.voice_bank import VoiceBankManager, suggest_speaker_mapping
+        voices = VoiceBankManager().list_voices()
+        f0_map = suggest_speaker_mapping(self.vc_target_speakers, voices, mode="f0")
+        self._vc_rebuild_target_mapping_rows(custom_mapping=f0_map)
+
+    def _vc_start_dub_mapped(self):
+        tgt = self.vc_tgt_edit.text().strip()
+        if not tgt or not os.path.exists(tgt):
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn Video đích hợp lệ.")
+            return
+
+        api_key = self.vc_tgt_api_key_edit.text().strip()
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
+
+        from ecoup.dubbing.config import DubbingConfig
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+
+        p = Path(tgt)
+        proj_dir = p.parent / f"dub_project_{p.stem}"
+        bank = VoiceBankManager()
+
+        spk_map: dict[str, str] = {}
+        for spk_id, combo in self.vc_target_combos.items():
+            norm_id = VoiceBankManager._normalize_choice_id(combo.currentText())
+            if norm_id:
+                spk_map[spk_id] = norm_id
+
+        cfg = DubbingConfig(project_dir=str(proj_dir))
+        cfg.tts.backend = "openvoice"
+        cfg.tts.voice_bank_dir = str(bank.bank_dir)
+        cfg.tts.speaker_voice_map = spk_map
+        cfg.tts.pitch_match_mode = self._vc_pitch_mode_from_text(self.vc_tgt_pitch_combo.currentText())
+        cfg.tts.pitch_shift_semitones = float(self.vc_tgt_pitch_spin.value())
+        cfg.asr.model_size = self.vc_tgt_whisper_combo.currentText()
+        cfg.translation.model = self.vc_tgt_gemini_combo.currentText()
+
+        num_txt = self.vc_tgt_num_combo.currentText()
+        cfg.diarization.num_speakers = int(num_txt) if num_txt.isdigit() else None
+
+        self.vc_dub_start_btn.setEnabled(False)
+        self.vc_dub_cancel_btn.setEnabled(True)
+        self.vc_dub_prog.setValue(0)
+        self.status_badge.setText("Đang lồng tiếng Clone...")
+
+        self.vc_dub_worker = DubbingWorker(cfg, tgt, self.vc_tgt_context_edit.text().strip())
+        self.vc_dub_worker.progress_sig.connect(self._vc_on_dub_mapped_progress)
+        self.vc_dub_worker.log_sig.connect(lambda msg: self.log_box.append(msg))
+        self.vc_dub_worker.finished_sig.connect(self._vc_on_dub_mapped_finished)
+        self.vc_dub_worker.start()
+
+    def _vc_on_dub_mapped_progress(self, step: str, frac: float):
+        base = {"S0": 5, "S1": 15, "S2": 30, "S3": 42, "S4": 50, "S5": 62, "S6": 78, "S7": 88, "S8": 94, "S9": 98}.get(step, 50)
+        self.vc_dub_prog.setValue(min(99, int(base + frac * 5)))
+
+    def _vc_on_dub_mapped_finished(self, success: bool, res: dict, message: str):
+        self.vc_dub_start_btn.setEnabled(True)
+        self.vc_dub_cancel_btn.setEnabled(False)
+        self.status_badge.setText("Sẵn sàng")
+        self.vc_dub_prog.setValue(100 if success else 0)
+        if success:
+            self.log_box.append(f"[Studio Lồng tiếng] Thành công: {res.get('video_path', '')}")
+            QMessageBox.information(self, "Hoàn tất", f"{message}\n\nVideo: {res.get('video_path', '')}")
+        else:
+            self.log_box.append(f"[Studio Lồng tiếng lỗi] {message}")
+            QMessageBox.critical(self, "Lỗi", message)
+
+    def _vc_cancel_dub_mapped(self):
+        if self.vc_dub_worker:
+            self.vc_dub_worker.cancel()
+
+    def _vc_play_tts_ref(self):
+        choice = self.vc_tts_clone_combo.currentText().strip()
+        if not choice:
+            QMessageBox.information(self, "Thông báo", "Chưa có bản Giọng Clone nào để nghe thử.")
+            return
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+        entry = VoiceBankManager().get_voice(choice)
+        if entry:
+            self._open_local_media(entry.preview_mp3_path or entry.ref_wav_path)
+
+    def _vc_start_tts_mp3(self):
+        choice = self.vc_tts_clone_combo.currentText().strip()
+        text = self.vc_tts_text_edit.toPlainText().strip()
+        out_mp3 = self.vc_tts_out_edit.text().strip()
+        if not choice:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng chọn một bản Giọng Clone trước.")
+            return
+        if not text:
+            QMessageBox.warning(self, "Lỗi", "Vui lòng nhập nội dung văn bản cần đọc.")
+            return
+        if not out_mp3:
+            out_mp3 = str(Path("outputs/tts_clone_output.mp3"))
+            self.vc_tts_out_edit.setText(out_mp3)
+
+        lang = "en" if "(en)" in self.vc_tts_lang_combo.currentText().lower() else "vi"
+        self.vc_tts_start_btn.setEnabled(False)
+        self.vc_tts_prog.setValue(0)
+        self.status_badge.setText("Đang xuất MP3...")
+        self.vc_tts_worker = TtsCloneMp3Worker(
+            clone_spec=choice,
+            text=text,
+            output_mp3=out_mp3,
+            base_lang=lang,
+            speed=float(self.vc_tts_speed_spin.value()),
+            pitch_match_mode=self._vc_pitch_mode_from_text(self.vc_tts_pitch_combo.currentText()),
+            pitch_shift_semitones=float(self.vc_tts_pitch_spin.value()),
+        )
+        self.vc_tts_worker.progress_sig.connect(lambda f: self.vc_tts_prog.setValue(int(f * 100)))
+        self.vc_tts_worker.log_sig.connect(lambda msg: self.log_box.append(msg))
+        self.vc_tts_worker.finished_sig.connect(self._vc_on_tts_finished)
+        self.vc_tts_worker.start()
+
+    def _vc_on_tts_finished(self, success: bool, rep: dict, message: str):
+        self.vc_tts_start_btn.setEnabled(True)
+        self.status_badge.setText("Sẵn sàng")
+        self.vc_tts_prog.setValue(100 if success else 0)
+        if success:
+            self.log_box.append(f"[TTS Xuất MP3] {rep.get('mp3_path', '')} ({rep.get('duration_s', 0)}s)")
+            QMessageBox.information(self, "Xuất MP3 thành công", f"{message}\nFile: {rep.get('mp3_path', '')}")
+        else:
+            QMessageBox.critical(self, "Lỗi xuất MP3", message)
 
 
 def main():

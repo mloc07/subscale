@@ -81,15 +81,26 @@ class TranslationDubbingConfig:
 
 @dataclass
 class TtsDubbingConfig:
-    backend: str = "openvoice"  # "openvoice", "f5", "gtts", "mock"
+    backend: str = "openvoice"  # "openvoice", "clone", "f5", "gtts", "mock"
     default_speed: float = 1.0
+    min_speed: float = 0.85
     max_speedup: float = 1.35
+    pitch_match_mode: str = "auto"  # "auto", "none", "manual"
+    pitch_shift_semitones: float = 0.0
+    speaker_voice_map: dict[str, str] = field(default_factory=dict)
+    voice_bank_dir: Optional[str] = None
     mock: bool = False
 
     def validate(self) -> None:
         valid_backends = ("openvoice", "clone", "f5", "gtts", "mock")
         if self.backend not in valid_backends:
             raise ValueError(f"Unsupported TTS backend: {self.backend}")
+        if not (0.5 <= self.min_speed <= 1.0):
+            raise ValueError(f"min_speed must be between 0.5 and 1.0, got {self.min_speed}")
+        if not (1.0 <= self.max_speedup <= 2.0):
+            raise ValueError(f"max_speedup must be between 1.0 and 2.0, got {self.max_speedup}")
+        if self.pitch_match_mode not in ("auto", "none", "manual"):
+            raise ValueError(f"Unsupported pitch_match_mode: {self.pitch_match_mode}")
 
 
 @dataclass
@@ -139,7 +150,7 @@ class DubbingConfig:
         elif step_name == "S6":
             data = asdict(self.tts)
         elif step_name == "S7":
-            data = {"speedup": self.tts.max_speedup}
+            data = {"speedup": self.tts.max_speedup, "min_speed": self.tts.min_speed}
         elif step_name == "S8":
             data = asdict(self.mixing)
         elif step_name == "S9":

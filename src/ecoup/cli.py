@@ -281,7 +281,37 @@ def main(args: Optional[list[str]] = None) -> int:
     dub_parser.add_argument("--translate-model", default="gemini-2.5-flash", help="Gemini translation model")
     dub_parser.add_argument("--num-speakers", type=int, default=None, help="Number of speakers (optional)")
     dub_parser.add_argument("--context", default="", help="Context notes for translator/dubbing style")
+    dub_parser.add_argument("--voice-map", default=None, help='Speaker mapping JSON/file or k=v list (e.g. "spk_0=clone1,spk_1=clone2")')
+    dub_parser.add_argument("--voice-bank", default=None, help="Directory of cloned Voice Bank")
+    dub_parser.add_argument("--min-speed", type=float, default=0.85, help="Minimum alignment speed factor (0.5..1.0)")
+    dub_parser.add_argument("--pitch-mode", default="auto", choices=["auto", "none", "manual"], help="Pitch alignment mode")
+    dub_parser.add_argument("--pitch-shift", type=float, default=0.0, help="Manual pitch shift semitones")
+    dub_parser.add_argument("--mock", action="store_true", help="Run in mock mode for offline/unit tests")
     dub_parser.add_argument("--step", default=None, choices=["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9"], help="Run up to specific step only")
+
+    # clone-voices command
+    clone_parser = subparsers.add_parser("clone-voices", help="Extract & clone all speaker voices from video into Voice Bank")
+    clone_parser.add_argument("-i", "--input", required=True, help="Path to source video/audio")
+    clone_parser.add_argument("--bank-dir", default=None, help="Directory of Voice Bank")
+    clone_parser.add_argument("--label", default="", help="Display label prefix for cloned voices")
+    clone_parser.add_argument("--num-speakers", type=int, default=None, help="Expected number of speakers")
+    clone_parser.add_argument("--whisper-model", default="medium", help="Whisper model size")
+    clone_parser.add_argument("--distance-threshold", type=float, default=0.72, help="Diarization distance threshold")
+    clone_parser.add_argument("--pitch-mode", default="auto", choices=["auto", "none", "manual"], help="Pitch alignment mode")
+    clone_parser.add_argument("--mock", action="store_true", help="Run in mock mode")
+
+    # tts-clone command
+    tts_clone_parser = subparsers.add_parser("tts-clone", help="Read text using a cloned voice and export .mp3")
+    tts_clone_parser.add_argument("--clone", required=True, help="Clone ID in Voice Bank or path to reference .wav")
+    tts_clone_parser.add_argument("--text", default="", help="Text to synthesize")
+    tts_clone_parser.add_argument("--text-file", default=None, help="UTF-8 text file to synthesize")
+    tts_clone_parser.add_argument("-o", "--output", required=True, help="Output .mp3 path")
+    tts_clone_parser.add_argument("--bank-dir", default=None, help="Directory of Voice Bank")
+    tts_clone_parser.add_argument("--lang", default="vi", help="TTS language (default: vi)")
+    tts_clone_parser.add_argument("--speed", type=float, default=1.0, help="Reading speed (0.6..1.8)")
+    tts_clone_parser.add_argument("--pitch-mode", default="auto", choices=["auto", "none", "manual"], help="Pitch alignment mode")
+    tts_clone_parser.add_argument("--pitch-shift", type=float, default=0.0, help="Manual pitch shift semitones")
+    tts_clone_parser.add_argument("--mock", action="store_true", help="Run in mock mode")
 
     parsed = parser.parse_args(args)
 
@@ -332,8 +362,33 @@ def main(args: Optional[list[str]] = None) -> int:
         cfg.tts.backend = parsed.backend
         cfg.asr.model_size = parsed.whisper_model
         cfg.translation.model = parsed.translate_model
+        cfg.tts.min_speed = parsed.min_speed
+        cfg.tts.pitch_match_mode = parsed.pitch_mode
+        cfg.tts.pitch_shift_semitones = parsed.pitch_shift
+        if parsed.voice_bank:
+            cfg.tts.voice_bank_dir = parsed.voice_bank
+        if parsed.mock or parsed.backend == "mock":
+            cfg.demucs.mock = True
+            cfg.asr.mock = True
+            cfg.diarization.mock = True
+            cfg.translation.mock = True
+            cfg.tts.mock = True
         if parsed.num_speakers:
             cfg.diarization.num_speakers = parsed.num_speakers
+        if parsed.voice_map:
+            raw_map = parsed.voice_map.strip()
+            map_path = Path(raw_map)
+            if map_path.is_file():
+                cfg.tts.speaker_voice_map = json.loads(map_path.read_text(encoding="utf-8"))
+            elif raw_map.startswith("{"):
+                cfg.tts.speaker_voice_map = json.loads(raw_map)
+            else:
+                parsed_map = {}
+                for pair in raw_map.split(","):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        parsed_map[k.strip()] = v.strip()
+                cfg.tts.speaker_voice_map = parsed_map
 
         def _on_dub_progress(step: str, frac: float) -> None:
             print(f"[dubbing] {step}: {int(frac * 100)}%", flush=True)
@@ -361,6 +416,65 @@ def main(args: Optional[list[str]] = None) -> int:
         else:
             res = pipeline.run_full_pipeline(context_notes=parsed.context)
             print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+    elif parsed.command == "clone-voices":
+        import json
+        from dataclasses import asdict
+        from ecoup.dubbing.voice_bank import clone_voices_from_video
+
+        def _on_clone_progress(step: str, frac: float) -> None:
+            print(f"[clone-voices] {step}: {int(frac * 100)}%", flush=True)
+
+        entries = clone_voices_from_video(
+            video_path=parsed.input,
+            bank_dir=parsed.bank_dir,
+            label_prefix=parsed.label,
+            num_speakers=parsed.num_speakers,
+            whisper_model=parsed.whisper_model,
+            distance_threshold=parsed.distance_threshold,
+            pitch_match_mode=parsed.pitch_mode,
+            mock=parsed.mock,
+            on_progress=_on_clone_progress,
+        )
+        print(json.dumps([asdict(e) for e in entries], ensure_ascii=False, indent=2))
+        return 0
+    elif parsed.command == "tts-clone":
+        import json
+        from pathlib import Path
+        from ecoup.dubbing.tts import MockVoiceBackend, OpenVoiceBackend, synthesize_text_to_mp3
+        from ecoup.dubbing.voice_bank import VoiceBankManager
+
+        text_val = (parsed.text or "").strip()
+        if not text_val and parsed.text_file:
+            text_val = Path(parsed.text_file).read_text(encoding="utf-8").strip()
+        if not text_val:
+            print("[ERROR] Either --text or --text-file is required.")
+            return 1
+
+        bank = VoiceBankManager(parsed.bank_dir)
+        ref_path = bank.resolve_voice(parsed.clone)
+        if ref_path is None or not ref_path.exists():
+            print(f"[ERROR] Cloned voice not found: {parsed.clone}")
+            return 1
+
+        backend = (
+            MockVoiceBackend()
+            if parsed.mock
+            else OpenVoiceBackend(
+                base_lang=parsed.lang,
+                pitch_match_mode=parsed.pitch_mode,
+                pitch_shift_semitones=parsed.pitch_shift,
+            )
+        )
+        rep = synthesize_text_to_mp3(
+            text=text_val,
+            output_mp3=parsed.output,
+            backend=backend,
+            ref_audio_path=ref_path,
+            speed=parsed.speed,
+            speaker_id=parsed.clone,
+        )
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
         return 0
     elif parsed.command == "run":
         from pathlib import Path

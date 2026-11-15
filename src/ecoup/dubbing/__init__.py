@@ -24,7 +24,24 @@ from .translate import (
     TranslationConfig,
     count_vietnamese_syllables,
 )
-from .tts import F5VoiceBackend, GTTSVoiceBackend, MockVoiceBackend, VoiceBackend
+from .tts import (
+    F5VoiceBackend,
+    GTTSVoiceBackend,
+    MockVoiceBackend,
+    OpenVoiceBackend,
+    VoiceBackend,
+    estimate_median_f0_hz,
+    export_audio_mp3,
+    synthesize_text_to_mp3,
+)
+from .voice_bank import (
+    SPECIAL_ORIGINAL,
+    SPECIAL_SELF,
+    ClonedVoiceEntry,
+    VoiceBankManager,
+    clone_voices_from_video,
+    suggest_speaker_mapping,
+)
 from .voice_profile import VoiceProfile, build_voice_profiles, calculate_audio_quality
 
 __all__ = [
@@ -41,12 +58,17 @@ __all__ = [
     "DubbingSegment",
     "TranslatedDubSegment",
     "VoiceProfile",
+    "ClonedVoiceEntry",
+    "VoiceBankManager",
+    "SPECIAL_SELF",
+    "SPECIAL_ORIGINAL",
     "SpeakerDiarizer",
     "DubbingTranslator",
     "VoiceBackend",
     "MockVoiceBackend",
     "GTTSVoiceBackend",
     "F5VoiceBackend",
+    "OpenVoiceBackend",
     "DiarizationOptions",
     "AsrOptions",
     "TranslationConfig",
@@ -59,6 +81,11 @@ __all__ = [
     "export_speaker_previews",
     "build_voice_profiles",
     "calculate_audio_quality",
+    "clone_voices_from_video",
+    "suggest_speaker_mapping",
+    "estimate_median_f0_hz",
+    "export_audio_mp3",
+    "synthesize_text_to_mp3",
     "count_vietnamese_syllables",
     "is_hallucination",
     "align_audio_to_target_duration",
